@@ -1,0 +1,25 @@
+# Секреты
+.env
+
+# Данные
+users.json
+orders.json
+states.json
+drivers.json
+queue.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# PyCharm
+.idea/
+
+# Системное
+.DS_Store
