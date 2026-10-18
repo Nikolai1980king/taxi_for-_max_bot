@@ -23,3 +23,5 @@ env/
 
 # Системное
 .DS_Store
+events.jsonl
+stats.json
