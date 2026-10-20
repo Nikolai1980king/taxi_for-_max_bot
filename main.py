@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta
@@ -55,19 +56,18 @@ RADIUS_STEPS = [6, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 LOCATION_TTL_MINUTES = 30
 LOCATION_REMIND_INTERVAL = 30
 
+# Защита от дублей
+DEDUP_WINDOW_SECONDS = 2
+_last_messages = {}          # user_id -> (text, timestamp)
+_processed_callbacks = deque(maxlen=500)
+_last_callback_payloads = {}  # f"{user_id}:{payload}" -> timestamp
+_reminder_tasks = {}
+
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
-_processed_callbacks = deque(maxlen=500)
-_reminder_tasks = {}
-
 
 # ===================== ТЕКСТЫ ИНСТРУКЦИЙ =====================
-
-HELP_MAIN = (
-    "❓ Инструкция по использованию бота\n\n"
-    "Выберите раздел:"
-)
 
 HELP_DRIVER = (
     "🚗 Инструкция для водителя / доставщика\n\n"
@@ -76,8 +76,7 @@ HELP_DRIVER = (
     "3️⃣ Отправьте геопозицию — обязательно, иначе не получите заказы.\n"
     "4️⃣ При заказе нажмите «✅ Принять» или «❌ Отказаться».\n"
     "5️⃣ Ведите поездку: «📍 Я на месте» → «🚗 Поехали» → «🏁 Завершить».\n\n"
-    "Вы получаете и заказы такси, и заказы доставки.\n\n"
-    "Подробнее — в разделах ниже:"
+    "Вы получаете и заказы такси, и заказы доставки."
 )
 
 HELP_DRIVER_GEO = (
@@ -88,17 +87,12 @@ HELP_DRIVER_GEO = (
     "2. Нажмите «📍 Отправить мою геопозицию».\n"
     "3. Разрешите доступ к геолокации.\n\n"
     "⚠️ Отправляйте с телефона — в браузере может не работать.\n\n"
-    "🔄 Обновляйте каждые 30 минут — бот напомнит.\n\n"
-    "Координаты старше 30 минут считаются устаревшими. Вы попадёте в резервный список и получите заказ, только если рядом никого не найдётся."
+    "🔄 Обновляйте каждые 30 минут — бот напомнит."
 )
 
 HELP_DRIVER_ORDERS = (
     "🚕 Как принимать заказы\n\n"
-    "Когда клиент рядом (в радиусе 6 км) — вам придёт заказ:\n"
-    "• Адрес «Откуда» и «Куда»\n"
-    "• Расстояние до клиента\n"
-    "• Длина поездки и цена\n"
-    "• Телефон клиента\n\n"
+    "Когда клиент рядом — вам придёт заказ с адресами, ценой и телефоном.\n\n"
     "У вас 60 секунд, чтобы:\n"
     "• Нажать «✅ Принять» — заказ ваш.\n"
     "• Нажать «❌ Отказаться» — заказ уйдёт следующему.\n\n"
@@ -108,27 +102,26 @@ HELP_DRIVER_ORDERS = (
 HELP_DRIVER_TRIP = (
     "🏁 Как вести поездку\n\n"
     "Такси:\n"
-    "1. Приняли заказ — едете к пассажиру.\n"
+    "1. Приняли — едете к пассажиру.\n"
     "2. Приехали — «📍 Я на месте».\n"
-    "3. Пассажир сел — «🚗 Поехали».\n"
+    "3. Сели — «🚗 Поехали».\n"
     "4. Привезли — «🏁 Завершить поездку».\n\n"
     "Доставка:\n"
-    "1. Приняли заказ — едете забирать посылку.\n"
+    "1. Приняли — едете забирать.\n"
     "2. Забрали — «📦 Забрал».\n"
-    "3. Доставили — «🏁 Доставлено».\n\n"
-    "После завершения вы снова участвуете в подборе."
+    "3. Доставили — «🏁 Доставлено»."
 )
 
 HELP_PASSENGER = (
     "🧑 Инструкция для пассажира\n\n"
     "1️⃣ Нажмите «Заказать такси».\n"
-    "2️⃣ Введите адрес «Откуда» — куда подать машину.\n"
+    "2️⃣ Выберите «📍 Я сейчас здесь» или «✏️ Ввести вручную».\n"
     "3️⃣ Введите адрес «Куда» — куда ехать.\n"
     "4️⃣ Укажите телефон для связи (или пропустите).\n"
-    "5️⃣ Подтвердите заказ — увидите цену и расстояние.\n"
-    "6️⃣ Ждите водителя — придёт уведомление с данными машины.\n\n"
-    "📍 Если адрес не распознаётся — проверьте написание: «город, улица, дом».\n\n"
-    "❌ Отменить заказ можно кнопкой «Отменить заказ» в сообщении о заказе."
+    "5️⃣ Подтвердите заказ — увидите цену и расстояние.\n\n"
+    "📍 Если заказываете для другого человека — выберите «✏️ Ввести вручную» "
+    "и укажите адрес, где находится пассажир. В комментарии напишите, "
+    "для кого заказ и как связаться."
 )
 
 HELP_DELIVERY = (
@@ -137,10 +130,9 @@ HELP_DELIVERY = (
     "2️⃣ Введите адрес «Откуда» — где забрать посылку.\n"
     "3️⃣ Введите адрес «Куда» — куда доставить.\n"
     "4️⃣ Укажите имя и телефон получателя.\n"
-    "5️⃣ Добавьте комментарий (хрупкое, позвонить заранее и т.п.).\n"
+    "5️⃣ Добавьте комментарий.\n"
     "6️⃣ Подтвердите заказ — увидите цену и расстояние.\n\n"
-    "💰 Тариф доставки: 43 ₽/км, минимум 150 ₽.\n\n"
-    "📞 Водитель свяжется с получателем по указанному телефону."
+    "💰 Тариф доставки: 43 ₽/км, минимум 150 ₽."
 )
 
 
@@ -253,7 +245,6 @@ def _update_stats(event: dict):
 
 
 def rebuild_stats_from_users():
-    """Пересчитывает счётчики ролей и total_users из users.json (источник правды)."""
     users = load_json(USERS_FILE, {})
     stats = load_json(STATS_FILE, _default_stats())
 
@@ -267,14 +258,9 @@ def rebuild_stats_from_users():
     stats["total_users"] = len(users)
 
     save_json(STATS_FILE, stats)
-    logging.info(
-        f"[STATS] Пересчёт: пользователей={stats['total_users']}, "
-        f"пассажиров={passengers}, водителей={drivers}, доставка={delivery}"
-    )
 
 
 def reset_statistics():
-    """Удаляет stats.json и events.jsonl. users.json не трогает."""
     if os.path.exists(STATS_FILE):
         try:
             os.remove(STATS_FILE)
@@ -298,9 +284,7 @@ def ensure_user_tracked(user_id: int):
 
 
 def get_stats_text(period: str = "all") -> str:
-    # Автопересчёт ролей и total_users из users.json
     rebuild_stats_from_users()
-
     stats = load_json(STATS_FILE, {})
     if not stats:
         return "📊 Статистика пока пуста — нет данных."
@@ -410,18 +394,72 @@ async def geocode_address(addr: dict):
             verify="/etc/ssl/certs/ca-certificates.crt",
         ) as client:
             r = await client.get(url, params=params)
-            logging.info(f"[GEO] HTTP {r.status_code}")
             data = r.json()
         members = data["response"]["GeoObjectCollection"]["featureMember"]
         if not members:
-            logging.warning(f"[GEO] Не найдено: {query}")
             return None
         pos = members[0]["GeoObject"]["Point"]["pos"]
         lon_str, lat_str = pos.split(" ")
-        logging.info(f"[GEO] OK: lat={lat_str}, lon={lon_str}")
         return float(lat_str), float(lon_str)
     except Exception as e:
         logging.error(f"[GEO] Ошибка: {type(e).__name__}: {e}")
+        return None
+
+
+async def reverse_geocode(lat: float, lon: float):
+    url = "https://geocode-maps.yandex.ru/1.x/"
+    params = {
+        "apikey": YANDEX_GEOCODER_KEY,
+        "geocode": f"{lon},{lat}",
+        "format": "json",
+        "results": 1,
+    }
+    try:
+        async with httpx.AsyncClient(
+            timeout=10,
+            verify="/etc/ssl/certs/ca-certificates.crt",
+        ) as client:
+            r = await client.get(url, params=params)
+            data = r.json()
+        members = data["response"]["GeoObjectCollection"]["featureMember"]
+        if not members:
+            return None
+        geo = members[0]["GeoObject"]
+        meta = geo.get("metaDataProperty", {}).get("GeocoderMetaData", {})
+        components = meta.get("Address", {}).get("Components", [])
+
+        city = None
+        street = None
+        house = None
+        locality = None
+        area = None
+        province = None
+
+        for c in components:
+            kind = c.get("kind")
+            name = c.get("name")
+            if kind == "locality":
+                locality = name
+            elif kind == "area":
+                area = name
+            elif kind == "province":
+                province = name
+            elif kind == "street":
+                street = name
+            elif kind == "house":
+                house = name
+
+        city = locality or area or province
+        if not city:
+            return None
+
+        return {
+            "city": city,
+            "street": street or "",
+            "house": house or "",
+        }
+    except Exception as e:
+        logging.error(f"[GEO] Reverse ошибка: {type(e).__name__}: {e}")
         return None
 
 
@@ -437,7 +475,6 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
 
 
 async def calculate_trip(from_addr: dict, to_addr: dict, order_type: str = "taxi"):
-    logging.info(f"[GEO] Старт расчёта ({order_type})")
     coords_from = await geocode_address(from_addr)
     if not coords_from:
         return None, None, None, None
@@ -458,7 +495,6 @@ async def calculate_trip(from_addr: dict, to_addr: dict, order_type: str = "taxi
         min_price = MIN_PRICE_TAXI
 
     price = max(min_price, round(road_km * rate))
-    logging.info(f"[GEO] Прямо: {direct_km:.2f} км, дорога: {road_km:.2f} км, цена: {price} ₽ ({order_type})")
     return round(road_km, 1), price, coords_from[0], coords_from[1]
 
 
@@ -540,8 +576,7 @@ def drivers_with_fresh_location() -> list:
             updated_dt = datetime.fromisoformat(upd)
         except Exception:
             continue
-        age = now - updated_dt
-        if age > timedelta(minutes=LOCATION_TTL_MINUTES):
+        if now - updated_dt > timedelta(minutes=LOCATION_TTL_MINUTES):
             continue
         result.append((int(uid_str), lat, lon))
     return result
@@ -795,6 +830,34 @@ def kb_delivery_picked(order_id: str):
     return b.as_markup()
 
 
+# ===== КЛАВИАТУРЫ ГЕОЛОКАЦИИ ПАССАЖИРА =====
+
+def kb_from_choice():
+    b = InlineKeyboardBuilder()
+    b.row(
+        CallbackButton(text="📍 Я сейчас здесь", payload="from_geo"),
+        CallbackButton(text="✏️ Ввести вручную", payload="from_manual"),
+    )
+    b.row(CallbackButton(text="🏠 Назад в меню", payload="main_menu"))
+    return b.as_markup()
+
+
+def kb_from_geo_location():
+    b = InlineKeyboardBuilder()
+    b.row(RequestGeoLocationButton(text="📍 Отправить геопозицию"))
+    b.row(CallbackButton(text="✏️ Ввести вручную", payload="from_manual"))
+    return b.as_markup()
+
+
+def kb_from_confirm():
+    b = InlineKeyboardBuilder()
+    b.row(
+        CallbackButton(text="✅ Верно", payload="from_confirmed"),
+        CallbackButton(text="✏️ Ввести вручную", payload="from_manual"),
+    )
+    return b.as_markup()
+
+
 # ===================== НАПОМИНАНИЯ =====================
 
 async def location_reminder_loop(user_id: int):
@@ -807,10 +870,7 @@ async def location_reminder_loop(user_id: int):
         try:
             await bot.send_message(
                 user_id=user_id,
-                text=(
-                    "📍 Обновите геопозицию, чтобы получать заказы.\n\n"
-                    "Без свежих координат вы будете в конце очереди."
-                ),
+                text="📍 Обновите геопозицию, чтобы получать заказы.",
                 attachments=[kb_location_only()],
             )
         except Exception as e:
@@ -836,31 +896,25 @@ async def find_driver_by_radius(order_id: str):
     order = find_order(order_id)
     if not order:
         return None, None
-
     from_addr = order.get("from", {})
     p_lat = from_addr.get("lat")
     p_lon = from_addr.get("lon")
     if p_lat is None or p_lon is None:
         return None, None
-
     drivers_loc = drivers_with_fresh_location()
     if not drivers_loc:
         return None, None
-
     with_distance = []
     for uid, d_lat, d_lon in drivers_loc:
         dist = haversine(p_lat, p_lon, d_lat, d_lon)
         with_distance.append((uid, dist))
-
     with_distance.sort(key=lambda x: x[1])
-
     for radius in RADIUS_STEPS:
         in_radius = [(uid, d) for uid, d in with_distance if d <= radius]
         if in_radius:
             uid, dist = in_radius[0]
-            logging.info(f"[RADIUS] Найден {uid} на расстоянии {dist:.2f} км (радиус {radius})")
+            logging.info(f"[RADIUS] Найден {uid} на расстоянии {dist:.2f} км")
             return uid, dist
-
     return None, None
 
 
@@ -869,17 +923,13 @@ async def offer_order_to_driver(order_id: str, driver_id: int, distance_km: floa
     driver = get_driver(driver_id)
     if not order or not driver:
         return
-
     order_type = order.get("type", "taxi")
     from_text = format_address_full(order["from"])
     to_text = format_address_full(order["to"])
     phone = order.get("phone", "—") or "—"
     distance = order.get("distance_km", "—")
     price = order.get("price", "—")
-
-    dist_line = ""
-    if distance_km is not None:
-        dist_line = f"🚗 До клиента: {distance_km:.1f} км\n"
+    dist_line = f"🚗 До клиента: {distance_km:.1f} км\n" if distance_km is not None else ""
 
     if order_type == "delivery":
         recipient_name = order.get("recipient_name", "—")
@@ -926,7 +976,6 @@ async def offer_order_to_driver(order_id: str, driver_id: int, distance_km: floa
         await asyncio.sleep(ORDER_TIMEOUT)
         current = find_order(order_id)
         if current and current.get("status") == "offered" and current.get("offered_to") == str(driver_id):
-            logging.info(f"⏰ Таймер истёк для водителя {driver_id}")
             try:
                 await bot.send_message(
                     user_id=driver_id,
@@ -944,245 +993,43 @@ async def try_next_driver(order_id: str):
     order = find_order(order_id)
     if not order or order.get("status") in ("accepted", "arrived", "in_trip", "picked", "finished", "cancelled", "cancelled_by_driver", "cancelled_by_passenger"):
         return
-
     if order.get("status") == "offered":
         update_order(order_id, status="new", offered_to=None)
-
     driver_id, dist = await find_driver_by_radius(order_id)
     if driver_id:
         await offer_order_to_driver(order_id, driver_id, dist)
         return
-
     q = queue_load()
     drivers_loc_ids = {uid for uid, _, _ in drivers_with_fresh_location()}
     no_coord_queue = [uid for uid in q if int(uid) not in drivers_loc_ids]
-
     if no_coord_queue:
         next_driver = int(no_coord_queue[0])
         await offer_order_to_driver(order_id, next_driver, None)
         return
-
     update_order(order_id, status="waiting")
     try:
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text=(
-                f"⚠️ Нет свободных водителей!\n\n"
-                f"Заказ {order_id} ({order.get('type', 'taxi')}):\n"
-                f"Откуда: {format_address_full(order['from'])}\n"
-                f"Куда: {format_address_full(order['to'])}\n"
-                f"Телефон: {order.get('phone', '—')}\n"
-                f"Цена: {order.get('price', '—')} ₽"
-            ),
+            text=f"⚠️ Нет свободных водителей!\n\nЗаказ {order_id} ({order.get('type', 'taxi')})",
         )
-    except Exception as e:
-        logging.warning(f"Не удалось уведомить админа: {e}")
+    except Exception:
+        pass
 
 
-# ===================== ОБРАБОТЧИКИ =====================
-
-@dp.bot_started()
-async def on_bot_started(event: BotStarted):
-    user_id = event.user.user_id
-    chat_id = event.chat_id
-    ensure_user_tracked(user_id)
-    role = get_role(user_id)
-
-    if role == "passenger":
-        await bot.send_message(
-            chat_id=chat_id,
-            text="С возвращением! Вы пассажир. Выберите действие:",
-            attachments=[kb_passenger_menu()],
-        )
-    elif role == "delivery":
-        await bot.send_message(
-            chat_id=chat_id,
-            text="С возвращением! Вы в разделе доставки. Выберите действие:",
-            attachments=[kb_delivery_menu()],
-        )
-    elif role == "driver":
-        driver = get_driver(user_id)
-        if not driver:
-            set_state(user_id, {"step": "driver_reg", "data": {}})
-            await bot.send_message(
-                chat_id=chat_id,
-                text="Похоже, вы ещё не зарегистрированы как водитель.\n\nВведите ваше имя:",
-            )
-        else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"С возвращением, {driver['name']}! Выберите действие:",
-                attachments=[kb_driver_menu()],
-            )
-    else:
-        await bot.send_message(
-            chat_id=chat_id,
-            text="Привет! Это сервис такси и доставки «По Южному».\n\nКто вы?",
-            attachments=[kb_role_choice()],
-        )
-
-
-@dp.message_created()
-async def on_message(event: MessageCreated):
-    user_id = event.message.sender.user_id
-    text = (event.message.body.text or "").strip()
-    ensure_user_tracked(user_id)
-    logging.info(f"📩 {user_id}: '{text}'")
-
-    # ===== /admin =====
-    if text == "/admin":
-        if user_id != ADMIN_USER_ID:
-            return
-        await event.message.answer(
-            get_stats_text("all"),
-            attachments=[kb_stats_period()],
-        )
-        return
-
-    # ===== /admin_reset =====
-    if text == "/admin_reset":
-        if user_id != ADMIN_USER_ID:
-            return
-        reset_statistics()
-        await event.message.answer(
-            "🗑 Статистика сброшена.\n\n"
-            "Счётчики обнулены. Пользователи и заказы сохранены.\n\n"
-            "Напишите /admin — чтобы увидеть новую статистику.",
-            attachments=[kb_stats_period()],
-        )
-        return
-
-    # ===== ГЕОЛОКАЦИЯ =====
-    attachments = event.message.body.attachments if event.message.body else None
-    if attachments:
-        for att in attachments:
-            att_type = getattr(att, "type", None)
-            if att_type == "location" or str(att_type) == "location":
-                lat = getattr(att, "latitude", None)
-                lon = getattr(att, "longitude", None)
-                if lat is not None and lon is not None:
-                    logging.info(f"📍 Геолокация водителя {user_id}: lat={lat}, lon={lon}")
-                    driver = get_driver(user_id)
-                    if driver:
-                        driver["lat"] = lat
-                        driver["lon"] = lon
-                        driver["location_updated_at"] = datetime.now().isoformat()
-                        save_driver(user_id, driver)
-                        await event.message.answer(
-                            f"✅ Геопозиция обновлена.\n\n"
-                            f"Координаты: {lat:.5f}, {lon:.5f}\n\n"
-                            f"Теперь вы участвуете в подборе заказов рядом с вами.",
-                            attachments=[kb_driver_menu()],
-                        )
-                    else:
-                        await event.message.answer("⚠️ Сначала зарегистрируйтесь как водитель.")
-                    return
-
-    if text == "/reset":
-        reset_user(user_id)
-        stop_location_reminder(user_id)
-        await event.message.answer("🔄 Полный сброс выполнен.", attachments=[kb_role_choice()])
-        return
-
-    if text == "/start":
-        role = get_role(user_id)
-        if role == "passenger":
-            await event.message.answer(
-                "С возвращением! Вы пассажир. Выберите действие:",
-                attachments=[kb_passenger_menu()],
-            )
-        elif role == "delivery":
-            await event.message.answer(
-                "С возвращением! Вы в разделе доставки. Выберите действие:",
-                attachments=[kb_delivery_menu()],
-            )
-        elif role == "driver":
-            driver = get_driver(user_id)
-            if not driver:
-                set_state(user_id, {"step": "driver_reg", "data": {}})
-                await event.message.answer("Введите ваше имя:")
-            else:
-                await event.message.answer(
-                    f"С возвращением, {driver['name']}! Выберите действие:",
-                    attachments=[kb_driver_menu()],
-                )
-        else:
-            await event.message.answer(
-                "Привет! Это сервис такси и доставки «По Южному».\n\nКто вы?",
-                attachments=[kb_role_choice()],
-            )
-        return
-
-    state = get_state(user_id)
-    step = state.get("step")
-
-    if step == "order":
-        await handle_order_step(event, user_id, text, state)
-        return
-
-    if step == "delivery_order":
-        await handle_delivery_step(event, user_id, text, state)
-        return
-
-    if step == "driver_reg":
-        await handle_driver_reg(event, user_id, text, state)
-        return
-
-    if text.lower() in ("пассажир", "1"):
-        set_role(user_id, "passenger")
-        log_event("role_selected", user_id=user_id, role="passenger")
-        await event.message.answer("Отлично! Вы пассажир.", attachments=[kb_passenger_menu()])
-        return
-    if text.lower() in ("доставка", "3"):
-        set_role(user_id, "delivery")
-        log_event("role_selected", user_id=user_id, role="delivery")
-        await event.message.answer("Отлично! Вы в разделе доставки.", attachments=[kb_delivery_menu()])
-        return
-    if text.lower() in ("водитель", "2"):
-        set_role(user_id, "driver")
-        log_event("role_selected", user_id=user_id, role="driver")
-        set_state(user_id, {"step": "driver_reg", "data": {}})
-        await event.message.answer("Отлично! Вы водитель.\n\nВведите ваше имя:")
-        return
-
-    role = get_role(user_id)
-    if role == "passenger":
-        await event.message.answer("Вы пассажир. Выберите действие:", attachments=[kb_passenger_menu()])
-    elif role == "delivery":
-        await event.message.answer("Вы в разделе доставки. Выберите действие:", attachments=[kb_delivery_menu()])
-    elif role == "driver":
-        driver = get_driver(user_id)
-        if not driver:
-            set_state(user_id, {"step": "driver_reg", "data": {}})
-            await event.message.answer("Введите ваше имя:")
-        else:
-            await event.message.answer(
-                f"Вы водитель, {driver['name']}. Выберите действие:",
-                attachments=[kb_driver_menu()],
-            )
-    else:
-        await event.message.answer(
-            "Привет! Это сервис такси и доставки «По Южному».\n\nКто вы?",
-            attachments=[kb_role_choice()],
-        )
-
-
-# ===================== ВВОД АДРЕСА (ТАКСИ) =====================
+# ===================== ШАГИ ВВОДА АДРЕСА =====================
 
 ORDER_STEPS = [
-    ("from", "city", "📍 ОТКУДА\n\n🏙 Введите населённый пункт (город / станица / посёлок / хутор):"),
+    ("from", "city", "📍 ОТКУДА\n\n🏙 Введите населённый пункт:"),
     ("from", "street", "📍 ОТКУДА\n\n🛣 Введите улицу:"),
     ("from", "house", "📍 ОТКУДА\n\n🏠 Введите номер дома:"),
     ("from", "phone", "📍 ОТКУДА\n\n📞 Введите ваш телефон для связи\n\nИли нажмите «Пропустить»:"),
-    ("from", "comment", "📍 ОТКУДА\n\n💬 Комментарий для водителя (подъезд, как найти, и т.п.)\n\nИли нажмите «Пропустить»:"),
-    ("to", "city", "🏁 КУДА\n\n🏙 Введите населённый пункт (город / станица / посёлок / хутор):"),
+    ("from", "comment", "📍 ОТКУДА\n\n💬 Комментарий для водителя (подъезд, шлагбаум, для кого заказ, как найти):\n\nИли нажмите «Пропустить»:"),
+    ("to", "city", "🏁 КУДА\n\n🏙 Введите населённый пункт:"),
     ("to", "street", "🏁 КУДА\n\n🛣 Введите улицу:"),
     ("to", "house", "🏁 КУДА\n\n🏠 Введите номер дома:"),
-    ("to", "comment", "🏁 КУДА\n\n💬 Комментарий для водителя (подъезд, как найти, и т.п.)\n\nИли нажмите «Пропустить»:"),
+    ("to", "comment", "🏁 КУДА\n\n💬 Комментарий для водителя:\n\nИли нажмите «Пропустить»:"),
 ]
 
-
-# ===================== ВВОД АДРЕСА (ДОСТАВКА) =====================
 
 DELIVERY_STEPS = [
     ("from", "city", "📦 ОТКУДА ЗАБРАТЬ\n\n🏙 Введите населённый пункт:"),
@@ -1201,7 +1048,10 @@ DELIVERY_STEPS = [
 
 def get_current_step(state: dict):
     data = state.get("data", {})
+    from_geo = bool(data.get("from", {}).get("lat"))
     for addr_key, field, question in ORDER_STEPS:
+        if addr_key == "from" and from_geo and field in ("city", "street", "house"):
+            continue
         addr = data.get(addr_key, {})
         if field not in addr:
             return addr_key, field, question
@@ -1219,6 +1069,7 @@ def get_current_delivery_step(state: dict):
 
 async def send_next_step(chat_answer, data: dict):
     next_step = get_current_step({"data": data})
+    logging.info(f"[send_next_step] data={data}, next_step={next_step}")
     if next_step is None:
         return False
     _, next_field, next_question = next_step
@@ -1243,6 +1094,7 @@ async def handle_order_step(event: MessageCreated, user_id: int, text: str, stat
     data = state.get("data", {})
 
     current = get_current_step(state)
+    logging.info(f"[handle_order_step] text='{text}', current={current}, data_from={data.get('from')}")
     if current is None:
         await show_order_summary(event, user_id, data)
         return
@@ -1251,15 +1103,21 @@ async def handle_order_step(event: MessageCreated, user_id: int, text: str, stat
 
     if field in ("city", "street", "house"):
         if not text or text.lower() in ("пропустить", "skip", "/skip"):
-            await event.message.answer(
-                "❌ Это поле обязательно. Пожалуйста, введите значение:\n\n" + question
-            )
+            await event.message.answer("❌ Это поле обязательно. Введите значение:\n\n" + question)
             return
 
     if addr_key not in data:
         data[addr_key] = {}
+
+    # Защита: если значение уже сохранено — не отправляем шаг повторно
+    if data[addr_key].get(field) == text:
+        logging.info(f"[order_step] {addr_key}.{field} уже = '{text}' — пропуск")
+        return
+
     data[addr_key][field] = text
-    set_state(user_id, {"step": "order", "data": data})
+    set_data_log = {"step": "order", "data": data}
+    set_state(user_id, set_data_log)
+    logging.info(f"[handle_order_step] после сохранения: data_from={data.get('from')}")
 
     if get_current_step({"data": data}) is None:
         await show_order_summary(event, user_id, data)
@@ -1270,37 +1128,33 @@ async def handle_order_step(event: MessageCreated, user_id: int, text: str, stat
 
 async def handle_delivery_step(event: MessageCreated, user_id: int, text: str, state: dict):
     data = state.get("data", {})
-
     current = get_current_delivery_step(state)
     if current is None:
         await show_delivery_summary(event, user_id, data)
         return
-
     addr_key, field, question = current
-
     if addr_key in ("from", "to") and field in ("city", "street", "house"):
         if not text or text.lower() in ("пропустить", "skip", "/skip"):
-            await event.message.answer(
-                "❌ Это поле обязательно. Пожалуйста, введите значение:\n\n" + question
-            )
+            await event.message.answer("❌ Это поле обязательно. Введите значение:\n\n" + question)
             return
-
     if addr_key == "recipient" and field in ("name", "phone"):
         if not text or text.lower() in ("пропустить", "skip", "/skip"):
-            await event.message.answer(
-                "❌ Это поле обязательно. Пожалуйста, введите значение:\n\n" + question
-            )
+            await event.message.answer("❌ Это поле обязательно. Введите значение:\n\n" + question)
             return
 
     if addr_key not in data:
         data[addr_key] = {}
+
+    # Защита от дублей
+    if data[addr_key].get(field) == text:
+        logging.info(f"[delivery_step] {addr_key}.{field} уже = '{text}' — пропуск")
+        return
+
     data[addr_key][field] = text
     set_state(user_id, {"step": "delivery_order", "data": data})
-
     if get_current_delivery_step({"data": data}) is None:
         await show_delivery_summary(event, user_id, data)
         return
-
     await send_next_delivery_step(event.message.answer, data)
 
 
@@ -1309,7 +1163,6 @@ async def show_order_summary(event, user_id: int, data: dict):
         send_func = event.message.answer
     else:
         send_func = event.send
-
     from_addr = data.get("from", {})
     to_addr = data.get("to", {})
     from_text = format_address_full(from_addr)
@@ -1319,22 +1172,18 @@ async def show_order_summary(event, user_id: int, data: dict):
     await send_func("🔎 Считаю расстояние и цену, подождите...")
 
     distance, price, from_lat, from_lon = await calculate_trip(from_addr, to_addr, "taxi")
-
     if distance is None:
         await send_func(
             "⚠️ Не удалось определить адрес на карте.\n\n"
-            "Проверьте, правильно ли указаны:\n"
-            "• населённый пункт\n"
-            "• улица\n"
-            "• номер дома\n\n"
-            "Начните заказ заново: /start → «Заказать такси».",
+            "Проверьте адреса. Начните заново: /start → «Заказать такси».",
             attachments=[kb_passenger_menu()],
         )
         set_state(user_id, {})
         return
 
-    from_addr["lat"] = from_lat
-    from_addr["lon"] = from_lon
+    if not from_addr.get("lat"):
+        from_addr["lat"] = from_lat
+        from_addr["lon"] = from_lon
     data["from"] = from_addr
     data["distance_km"] = distance
     data["price"] = price
@@ -1357,12 +1206,10 @@ async def show_delivery_summary(event, user_id: int, data: dict):
         send_func = event.message.answer
     else:
         send_func = event.send
-
     from_addr = data.get("from", {})
     to_addr = data.get("to", {})
     recipient = data.get("recipient", {})
     customer = data.get("customer", {})
-
     from_text = format_address_full(from_addr)
     to_text = format_address_full(to_addr)
     recipient_name = recipient.get("name", "—")
@@ -1372,19 +1219,18 @@ async def show_delivery_summary(event, user_id: int, data: dict):
     await send_func("🔎 Считаю расстояние и цену доставки, подождите...")
 
     distance, price, from_lat, from_lon = await calculate_trip(from_addr, to_addr, "delivery")
-
     if distance is None:
         await send_func(
             "⚠️ Не удалось определить адрес на карте.\n\n"
-            "Проверьте, правильно ли указаны адреса.\n\n"
-            "Начните заново: /start → «📦 Доставка».",
+            "Проверьте адреса. Начните заново: /start → «📦 Доставка».",
             attachments=[kb_delivery_menu()],
         )
         set_state(user_id, {})
         return
 
-    from_addr["lat"] = from_lat
-    from_addr["lon"] = from_lon
+    if not from_addr.get("lat"):
+        from_addr["lat"] = from_lat
+        from_addr["lon"] = from_lon
     data["from"] = from_addr
     data["distance_km"] = distance
     data["price"] = price
@@ -1406,46 +1252,265 @@ async def show_delivery_summary(event, user_id: int, data: dict):
 
 async def handle_driver_reg(event: MessageCreated, user_id: int, text: str, state: dict):
     data = state.get("data", {})
-
     if "name" not in data:
         data["name"] = text
         set_state(user_id, {"step": "driver_reg", "data": data})
         await event.message.answer(f"Имя: {text}\n\nВведите марку и цвет машины:")
         return
-
     if "car" not in data:
         data["car"] = text
         set_state(user_id, {"step": "driver_reg", "data": data})
         await event.message.answer(f"Машина: {text}\n\nВведите госномер:")
         return
-
     if "plate" not in data:
         data["plate"] = text
         set_state(user_id, {"step": "driver_reg", "data": data})
         await event.message.answer(f"Госномер: {text}\n\nВведите ваш телефон:")
         return
-
     if "phone" not in data:
         data["phone"] = text
         save_driver(user_id, {
-            "name": data["name"],
-            "car": data["car"],
-            "plate": data["plate"],
-            "phone": data["phone"],
-            "status": "offline",
-            "registered_at": datetime.now().isoformat(),
+            "name": data["name"], "car": data["car"],
+            "plate": data["plate"], "phone": data["phone"],
+            "status": "offline", "registered_at": datetime.now().isoformat(),
         })
         set_state(user_id, {})
         await event.message.answer(
             f"✅ Регистрация завершена!\n\n"
-            f"Имя: {data['name']}\n"
-            f"Машина: {data['car']}\n"
-            f"Госномер: {data['plate']}\n"
-            f"Телефон: {data['phone']}\n\n"
-            f"Чтобы начать получать заказы, нажмите «Выйти на линию» и обязательно отправьте геопозицию.",
+            f"Имя: {data['name']}\nМашина: {data['car']}\n"
+            f"Госномер: {data['plate']}\nТелефон: {data['phone']}\n\n"
+            f"Нажмите «Выйти на линию» и обязательно отправьте геопозицию.",
             attachments=[kb_driver_menu()],
         )
         return
+
+
+async def handle_passenger_geo(event, user_id: int, lat: float, lon: float):
+    await event.message.answer("🔎 Определяю адрес, подождите...")
+    addr = await reverse_geocode(lat, lon)
+
+    if not addr:
+        await event.message.answer(
+            "⚠️ Не удалось определить адрес.\n\n"
+            "Введите вручную:\n\n" + ORDER_STEPS[0][2],
+        )
+        set_state(user_id, {"step": "order", "data": {"from": {}}})
+        return
+
+    from_data = {
+        "city": addr["city"],
+        "street": addr["street"],
+        "house": addr["house"],
+        "lat": lat,
+        "lon": lon,
+    }
+    set_state(user_id, {"step": "order_geo_confirm", "data": {"from": from_data}})
+
+    house_note = "" if addr["house"] else "\n⚠️ Дом не определён — уточните в комментарии."
+    await event.message.answer(
+        f"📍 Ваш адрес:\n"
+        f"{format_address(from_data)}"
+        f"{house_note}\n\n"
+        f"Всё верно?",
+        attachments=[kb_from_confirm()],
+    )
+
+
+# ===================== ОБРАБОТЧИКИ =====================
+
+@dp.bot_started()
+async def on_bot_started(event: BotStarted):
+    user_id = event.user.user_id
+    chat_id = event.chat_id
+    ensure_user_tracked(user_id)
+    role = get_role(user_id)
+
+    if role == "passenger":
+        await bot.send_message(
+            chat_id=chat_id,
+            text="С возвращением! Вы пассажир. Выберите действие:",
+            attachments=[kb_passenger_menu()],
+        )
+    elif role == "delivery":
+        await bot.send_message(
+            chat_id=chat_id,
+            text="С возвращением! Вы в разделе доставки.",
+            attachments=[kb_delivery_menu()],
+        )
+    elif role == "driver":
+        driver = get_driver(user_id)
+        if not driver:
+            set_state(user_id, {"step": "driver_reg", "data": {}})
+            await bot.send_message(chat_id=chat_id, text="Введите ваше имя:")
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"С возвращением, {driver['name']}!",
+                attachments=[kb_driver_menu()],
+            )
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Привет! Это сервис такси и доставки «По Южному».\n\nКто вы?",
+            attachments=[kb_role_choice()],
+        )
+
+
+@dp.message_created()
+async def on_message(event: MessageCreated):
+    user_id = event.message.sender.user_id
+    text = (event.message.body.text or "").strip()
+
+    # ===== ЗАЩИТА ОТ ДУБЛЕЙ =====
+    now = time.time()
+    last = _last_messages.get(user_id)
+    if last and last[0] == text and (now - last[1]) < DEDUP_WINDOW_SECONDS:
+        logging.info(f"[on_message] Дубль '{text}' за {DEDUP_WINDOW_SECONDS}с — пропуск")
+        return
+    _last_messages[user_id] = (text, now)
+    # ============================
+
+    ensure_user_tracked(user_id)
+    logging.info(f"📩 {user_id}: '{text}'")
+
+    if text == "/admin":
+        if user_id != ADMIN_USER_ID:
+            return
+        await event.message.answer(get_stats_text("all"), attachments=[kb_stats_period()])
+        return
+
+    if text == "/admin_reset":
+        if user_id != ADMIN_USER_ID:
+            return
+        reset_statistics()
+        await event.message.answer(
+            "🗑 Статистика сброшена.\n\n"
+            "Счётчики обнулены. Пользователи и заказы сохранены.\n\n"
+            "Напишите /admin — чтобы увидеть новую статистику.",
+            attachments=[kb_stats_period()],
+        )
+        return
+
+    # ===== ГЕОЛОКАЦИЯ =====
+    attachments = event.message.body.attachments if event.message.body else None
+    if attachments:
+        for att in attachments:
+            att_type = getattr(att, "type", None)
+            if att_type == "location" or str(att_type) == "location":
+                lat = getattr(att, "latitude", None)
+                lon = getattr(att, "longitude", None)
+                if lat is not None and lon is not None:
+                    role = get_role(user_id)
+                    state = get_state(user_id)
+                    step = state.get("step")
+
+                    # Водитель обновляет координаты
+                    driver = get_driver(user_id)
+                    if driver:
+                        driver["lat"] = lat
+                        driver["lon"] = lon
+                        driver["location_updated_at"] = datetime.now().isoformat()
+                        save_driver(user_id, driver)
+                        await event.message.answer(
+                            f"✅ Геопозиция обновлена.\n\n"
+                            f"Координаты: {lat:.5f}, {lon:.5f}",
+                            attachments=[kb_driver_menu()],
+                        )
+                        return
+
+                    # Пассажир в процессе заказа — reverse geocoding
+                    if step == "order_geo_wait":
+                        await handle_passenger_geo(event, user_id, lat, lon)
+                        return
+
+                    await event.message.answer("⚠️ Координаты получены, но сейчас они не нужны.")
+                    return
+
+    if text == "/reset":
+        reset_user(user_id)
+        stop_location_reminder(user_id)
+        await event.message.answer("🔄 Полный сброс выполнен.", attachments=[kb_role_choice()])
+        return
+
+    if text == "/start":
+        role = get_role(user_id)
+        if role == "passenger":
+            await event.message.answer(
+                "С возвращением! Вы пассажир.",
+                attachments=[kb_passenger_menu()],
+            )
+        elif role == "delivery":
+            await event.message.answer(
+                "С возвращением! Вы в разделе доставки.",
+                attachments=[kb_delivery_menu()],
+            )
+        elif role == "driver":
+            driver = get_driver(user_id)
+            if not driver:
+                set_state(user_id, {"step": "driver_reg", "data": {}})
+                await event.message.answer("Введите ваше имя:")
+            else:
+                await event.message.answer(
+                    f"С возвращением, {driver['name']}!",
+                    attachments=[kb_driver_menu()],
+                )
+        else:
+            await event.message.answer(
+                "Привет! Это сервис такси и доставки «По Южному».\n\nКто вы?",
+                attachments=[kb_role_choice()],
+            )
+        return
+
+    state = get_state(user_id)
+    step = state.get("step")
+
+    if step == "order":
+        await handle_order_step(event, user_id, text, state)
+        return
+    if step == "delivery_order":
+        await handle_delivery_step(event, user_id, text, state)
+        return
+    if step == "driver_reg":
+        await handle_driver_reg(event, user_id, text, state)
+        return
+
+    if text.lower() in ("пассажир", "1"):
+        set_role(user_id, "passenger")
+        log_event("role_selected", user_id=user_id, role="passenger")
+        await event.message.answer("Отлично! Вы пассажир.", attachments=[kb_passenger_menu()])
+        return
+    if text.lower() in ("доставка", "3"):
+        set_role(user_id, "delivery")
+        log_event("role_selected", user_id=user_id, role="delivery")
+        await event.message.answer("Отлично! Вы в разделе доставки.", attachments=[kb_delivery_menu()])
+        return
+    if text.lower() in ("водитель", "2"):
+        set_role(user_id, "driver")
+        log_event("role_selected", user_id=user_id, role="driver")
+        set_state(user_id, {"step": "driver_reg", "data": {}})
+        await event.message.answer("Отлично! Вы водитель.\n\nВведите ваше имя:")
+        return
+
+    role = get_role(user_id)
+    if role == "passenger":
+        await event.message.answer("Вы пассажир.", attachments=[kb_passenger_menu()])
+    elif role == "delivery":
+        await event.message.answer("Вы в разделе доставки.", attachments=[kb_delivery_menu()])
+    elif role == "driver":
+        driver = get_driver(user_id)
+        if not driver:
+            set_state(user_id, {"step": "driver_reg", "data": {}})
+            await event.message.answer("Введите ваше имя:")
+        else:
+            await event.message.answer(
+                f"Вы водитель, {driver['name']}.",
+                attachments=[kb_driver_menu()],
+            )
+    else:
+        await event.message.answer(
+            "Привет! Это сервис такси и доставки «По Южному».\n\nКто вы?",
+            attachments=[kb_role_choice()],
+        )
 
 
 @dp.message_callback()
@@ -1454,9 +1519,20 @@ async def on_callback(event: MessageCallback):
     payload = event.callback.payload or ""
     callback_id = event.callback.callback_id
 
+    # Уровень 1: одинаковый callback_id
     if callback_id in _processed_callbacks:
+        logging.info(f"⏭ Дубль callback_id {callback_id} — пропуск")
         return
     _processed_callbacks.append(callback_id)
+
+    # Уровень 2: одинаковый user_id + payload за 2 сек
+    now = time.time()
+    key = f"{user_id}:{payload}"
+    last = _last_callback_payloads.get(key)
+    if last and (now - last) < DEDUP_WINDOW_SECONDS:
+        logging.info(f"⏭ Дубль callback {payload} за {DEDUP_WINDOW_SECONDS}с — пропуск")
+        return
+    _last_callback_payloads[key] = now
 
     logging.info(f"🔘 callback: user_id={user_id}, payload={payload}")
 
@@ -1464,28 +1540,22 @@ async def on_callback(event: MessageCallback):
         if user_id != ADMIN_USER_ID:
             return
         period_map = {
-            "stats_today": "today",
-            "stats_week": "week",
-            "stats_month": "month",
-            "stats_all": "all",
+            "stats_today": "today", "stats_week": "week",
+            "stats_month": "month", "stats_all": "all",
         }
-        period = period_map[payload]
-        await event.send(
-            text=get_stats_text(period),
-            attachments=[kb_stats_period()],
-        )
+        await event.send(text=get_stats_text(period_map[payload]), attachments=[kb_stats_period()])
         return
 
     if payload == "main_menu":
         role = get_role(user_id)
         if role == "passenger":
-            await event.send(text="Вы пассажир. Выберите действие:", attachments=[kb_passenger_menu()])
+            await event.send(text="Вы пассажир.", attachments=[kb_passenger_menu()])
         elif role == "delivery":
-            await event.send(text="Вы в разделе доставки. Выберите действие:", attachments=[kb_delivery_menu()])
+            await event.send(text="Вы в разделе доставки.", attachments=[kb_delivery_menu()])
         elif role == "driver":
             driver = get_driver(user_id)
             if driver:
-                await event.send(text=f"Вы водитель, {driver['name']}. Выберите действие:", attachments=[kb_driver_menu()])
+                await event.send(text=f"Вы водитель, {driver['name']}.", attachments=[kb_driver_menu()])
             else:
                 set_state(user_id, {"step": "driver_reg", "data": {}})
                 await event.send(text="Введите ваше имя:")
@@ -1496,31 +1566,67 @@ async def on_callback(event: MessageCallback):
     if payload == "help_driver":
         await event.send(text=HELP_DRIVER, attachments=[kb_help_driver()])
         return
-
     if payload == "help_driver_geo":
         await event.send(text=HELP_DRIVER_GEO, attachments=[kb_help_driver()])
         return
-
     if payload == "help_driver_orders":
         await event.send(text=HELP_DRIVER_ORDERS, attachments=[kb_help_driver()])
         return
-
     if payload == "help_driver_trip":
         await event.send(text=HELP_DRIVER_TRIP, attachments=[kb_help_driver()])
         return
-
     if payload == "help_passenger":
         b = InlineKeyboardBuilder()
         b.row(CallbackButton(text="🏠 Назад в меню", payload="main_menu"))
         await event.send(text=HELP_PASSENGER, attachments=[b.as_markup()])
         return
-
     if payload == "help_delivery":
         b = InlineKeyboardBuilder()
         b.row(CallbackButton(text="🏠 Назад в меню", payload="main_menu"))
         await event.send(text=HELP_DELIVERY, attachments=[b.as_markup()])
         return
 
+    # ===== ГЕОЛОКАЦИЯ ПАССАЖИРА =====
+    if payload == "from_geo":
+        state = get_state(user_id)
+        if state.get("step") == "order_geo_wait":
+            logging.info("[from_geo] уже в ожидании геолокации — пропуск")
+            return
+        set_state(user_id, {"step": "order_geo_wait", "data": {}})
+        await event.send(
+            text=(
+                "📍 Нажмите кнопку ниже, чтобы отправить свою геопозицию.\n\n"
+                "⚠️ Отправляйте с телефона — в браузере может не работать."
+            ),
+            attachments=[kb_from_geo_location()],
+        )
+        return
+
+    if payload == "from_manual":
+        state = get_state(user_id)
+        if state.get("step") == "order" and state.get("data", {}).get("from", {}).get("city"):
+            logging.info("[from_manual] уже в ручном вводе — пропуск")
+            return
+        set_state(user_id, {"step": "order", "data": {"from": {}}})
+        await event.send(text=ORDER_STEPS[0][2])
+        return
+
+    if payload == "from_confirmed":
+        state = get_state(user_id)
+        step = state.get("step")
+        if step != "order_geo_confirm":
+            return
+        data = state.get("data", {})
+        if "from" not in data:
+            await event.send(text="Ошибка: адрес потерян.")
+            return
+        data["from"]["phone"] = ""  # ← добавить
+        set_state(user_id, {"step": "order", "data": data})
+        await event.send(
+            text=ORDER_STEPS[4][2],  # комментарий
+            attachments=[kb_skip_optional()],
+        )
+        return
     if payload == "skip_optional":
         state = get_state(user_id)
         step = state.get("step")
@@ -1534,13 +1640,12 @@ async def on_callback(event: MessageCallback):
             addr_key, field, _ = current
             allowed_skip = (field == "comment" or (addr_key == "customer" and field == "phone"))
             if not allowed_skip:
-                await event.send(text="Это поле обязательно, его нельзя пропустить.")
+                await event.send(text="Это поле обязательно.")
                 return
             if addr_key not in data:
                 data[addr_key] = {}
             data[addr_key][field] = ""
             set_state(user_id, {"step": "delivery_order", "data": data})
-
             if get_current_delivery_step({"data": data}) is None:
                 await show_delivery_summary(event, user_id, data)
                 return
@@ -1553,13 +1658,12 @@ async def on_callback(event: MessageCallback):
             return
         addr_key, field, _ = current
         if field not in ("comment", "phone"):
-            await event.send(text="Это поле обязательно, его нельзя пропустить.")
+            await event.send(text="Это поле обязательно.")
             return
         if addr_key not in data:
             data[addr_key] = {}
         data[addr_key][field] = ""
         set_state(user_id, {"step": "order", "data": data})
-
         if get_current_step({"data": data}) is None:
             await show_order_summary(event, user_id, data)
             return
@@ -1572,7 +1676,6 @@ async def on_callback(event: MessageCallback):
         stop_location_reminder(user_id)
         await event.send(text="Роль сброшена. Кто вы?", attachments=[kb_role_choice()])
         return
-
     if payload == "full_reset":
         reset_user(user_id)
         stop_location_reminder(user_id)
@@ -1582,22 +1685,20 @@ async def on_callback(event: MessageCallback):
     if payload == "role_passenger":
         set_role(user_id, "passenger")
         log_event("role_selected", user_id=user_id, role="passenger")
-        await event.send(text="Отлично! Вы пассажир. Выберите действие:", attachments=[kb_passenger_menu()])
+        await event.send(text="Отлично! Вы пассажир.", attachments=[kb_passenger_menu()])
         return
-
     if payload == "role_delivery":
         set_role(user_id, "delivery")
         log_event("role_selected", user_id=user_id, role="delivery")
-        await event.send(text="Отлично! Вы в разделе доставки. Выберите действие:", attachments=[kb_delivery_menu()])
+        await event.send(text="Отлично! Вы в разделе доставки.", attachments=[kb_delivery_menu()])
         return
-
     if payload == "role_driver":
         set_role(user_id, "driver")
         log_event("role_selected", user_id=user_id, role="driver")
         driver = get_driver(user_id)
         if driver:
             await event.send(
-                text=f"С возвращением, {driver['name']}! Выберите действие:",
+                text=f"С возвращением, {driver['name']}!",
                 attachments=[kb_driver_menu()],
             )
         else:
@@ -1607,13 +1708,17 @@ async def on_callback(event: MessageCallback):
 
     if payload == "passenger_order":
         free = queue_count()
-        if free == 0:
-            info = "⚠️ Свободных машин сейчас нет, но мы поищем для вас."
-        else:
-            info = f"🚕 Свободных машин на линии: {free}."
-        set_state(user_id, {"step": "order", "data": {}})
-        first_question = ORDER_STEPS[0][2]
-        await event.send(text=f"{info}\n\n{first_question}")
+        info = f"🚕 Свободных машин на линии: {free}." if free else "⚠️ Свободных машин сейчас нет."
+        set_state(user_id, {"step": "order_choose_from", "data": {}})
+        await event.send(
+            text=(
+                f"{info}\n\n"
+                f"📍 Откуда подать машину?\n\n"
+                f"• «📍 Я сейчас здесь» — отправить геопозицию.\n"
+                f"• «✏️ Ввести вручную» — если заказываете для другого или хотите указать адрес."
+            ),
+            attachments=[kb_from_choice()],
+        )
         return
 
     if payload == "passenger_history":
@@ -1647,10 +1752,7 @@ async def on_callback(event: MessageCallback):
 
     if payload == "delivery_order":
         free = queue_count()
-        if free == 0:
-            info = "⚠️ Свободных машин сейчас нет, но мы поищем для вас."
-        else:
-            info = f"🚕 Свободных машин на линии: {free}."
+        info = f"🚕 Свободных машин на линии: {free}." if free else "⚠️ Свободных машин сейчас нет."
         set_state(user_id, {"step": "delivery_order", "data": {}})
         first_question = DELIVERY_STEPS[0][2]
         await event.send(text=f"{info}\n\n📦 Оформляем доставку.\n\n{first_question}")
@@ -1660,7 +1762,7 @@ async def on_callback(event: MessageCallback):
         orders = orders_load()
         my = [o for o in orders if o.get("user_id") == user_id and o.get("type") == "delivery"]
         if not my:
-            await event.send(text="У вас пока нет заказов доставки.", attachments=[kb_delivery_menu()])
+            await event.send(text="У вас пока нет доставок.", attachments=[kb_delivery_menu()])
         else:
             text = "Ваши последние доставки:\n\n"
             for o in my[-5:]:
@@ -1691,27 +1793,19 @@ async def on_callback(event: MessageCallback):
             recipient = data.get("recipient", {})
             customer = data.get("customer", {})
             phone = customer.get("phone", "").strip() or "—"
-
             order = {
-                "id": order_id,
-                "type": "delivery",
-                "user_id": user_id,
-                "from": from_addr,
-                "to": to_addr,
+                "id": order_id, "type": "delivery",
+                "user_id": user_id, "from": from_addr, "to": to_addr,
                 "phone": phone,
                 "recipient_name": recipient.get("name", "—"),
                 "recipient_phone": recipient.get("phone", "—"),
-                "distance_km": distance,
-                "price": price,
-                "status": "new",
-                "driver_id": None,
+                "distance_km": distance, "price": price,
+                "status": "new", "driver_id": None,
                 "created_at": datetime.now().isoformat(),
             }
             save_order(order)
             set_state(user_id, {})
-
             log_event("order_created", user_id=user_id, order_id=order_id, order_type="delivery")
-
             await event.send(
                 text=(
                     f"✅ Заказ доставки принят!\n\n"
@@ -1724,7 +1818,6 @@ async def on_callback(event: MessageCallback):
                     f"Ищем для вас курьера..."
                 ),
             )
-
             try:
                 await bot.send_message(
                     chat_id=ADMIN_CHAT_ID,
@@ -1734,38 +1827,28 @@ async def on_callback(event: MessageCallback):
                         f"Доставить: {format_address_full(to_addr)}\n"
                         f"Получатель: {recipient.get('name', '—')}, {recipient.get('phone', '—')}\n"
                         f"Телефон заказчика: {phone}\n"
-                        f"Расстояние: {distance} км\n"
-                        f"Цена: {price} ₽\n"
+                        f"Расстояние: {distance} км\nЦена: {price} ₽\n"
                         f"Заказчик: {user_id}"
                     ),
                 )
             except Exception as e:
                 logging.warning(f"Не удалось уведомить админа: {e}")
-
             await try_next_driver(order_id)
             return
 
         phone = from_addr.get("phone", "").strip()
         phone_text = phone if phone else "—"
-
         order = {
-            "id": order_id,
-            "type": "taxi",
-            "user_id": user_id,
-            "from": from_addr,
-            "to": to_addr,
+            "id": order_id, "type": "taxi",
+            "user_id": user_id, "from": from_addr, "to": to_addr,
             "phone": phone_text,
-            "distance_km": distance,
-            "price": price,
-            "status": "new",
-            "driver_id": None,
+            "distance_km": distance, "price": price,
+            "status": "new", "driver_id": None,
             "created_at": datetime.now().isoformat(),
         }
         save_order(order)
         set_state(user_id, {})
-
         log_event("order_created", user_id=user_id, order_id=order_id, order_type="taxi")
-
         await event.send(
             text=(
                 f"✅ Заказ принят!\n\n"
@@ -1777,7 +1860,6 @@ async def on_callback(event: MessageCallback):
                 f"Ищем для вас машину..."
             ),
         )
-
         try:
             await bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
@@ -1785,15 +1867,12 @@ async def on_callback(event: MessageCallback):
                     f"🚕 Новый заказ такси {order_id}\n\n"
                     f"Откуда: {format_address_full(from_addr)}\n"
                     f"Куда: {format_address_full(to_addr)}\n"
-                    f"Расстояние: {distance} км\n"
-                    f"Цена: {price} ₽\n"
-                    f"Телефон: {phone_text}\n"
-                    f"Пассажир: {user_id}"
+                    f"Расстояние: {distance} км\nЦена: {price} ₽\n"
+                    f"Телефон: {phone_text}\nПассажир: {user_id}"
                 ),
             )
         except Exception as e:
             logging.warning(f"Не удалось уведомить админа: {e}")
-
         await try_next_driver(order_id)
         return
 
@@ -1801,15 +1880,9 @@ async def on_callback(event: MessageCallback):
         role = get_role(user_id)
         set_state(user_id, {})
         if role == "delivery":
-            await event.send(
-                text="Заказ доставки отменён. Возвращайтесь, когда понадобится.",
-                attachments=[kb_delivery_menu()],
-            )
+            await event.send(text="Заказ доставки отменён.", attachments=[kb_delivery_menu()])
         else:
-            await event.send(
-                text="Заказ отменён. Возвращайтесь, когда понадобится такси.",
-                attachments=[kb_passenger_menu()],
-            )
+            await event.send(text="Заказ отменён.", attachments=[kb_passenger_menu()])
         return
 
     if payload.startswith("passenger_cancel:"):
@@ -1821,18 +1894,10 @@ async def on_callback(event: MessageCallback):
         if order.get("status") in ("finished", "cancelled", "cancelled_by_driver", "cancelled_by_passenger"):
             await event.send(text="Заказ уже завершён или отменён.")
             return
-
         update_order(order_id, status="cancelled_by_passenger",
                      cancelled_at=datetime.now().isoformat())
-
-        log_event(
-            "order_cancelled",
-            user_id=user_id,
-            order_id=order_id,
-            order_type=order.get("type", "taxi"),
-            cancelled_by="passenger",
-        )
-
+        log_event("order_cancelled", user_id=user_id, order_id=order_id,
+                  order_type=order.get("type", "taxi"), cancelled_by="passenger")
         driver_id = order.get("driver_id")
         if driver_id:
             drv = get_driver(int(driver_id))
@@ -1841,23 +1906,16 @@ async def on_callback(event: MessageCallback):
             try:
                 await bot.send_message(
                     user_id=int(driver_id),
-                    text="⚠️ Клиент отменил заказ. Возвращаетесь в конец очереди.",
+                    text="⚠️ Клиент отменил заказ. Вы в конце очереди.",
                     attachments=[kb_driver_menu()],
                 )
-            except Exception as e:
-                logging.warning(f"Не удалось уведомить водителя: {e}")
-
+            except Exception:
+                pass
         role = get_role(user_id)
         if role == "delivery":
-            await event.send(
-                text="❌ Заказ доставки отменён.",
-                attachments=[kb_delivery_menu()],
-            )
+            await event.send(text="❌ Заказ доставки отменён.", attachments=[kb_delivery_menu()])
         else:
-            await event.send(
-                text="❌ Заказ отменён.",
-                attachments=[kb_passenger_menu()],
-            )
+            await event.send(text="❌ Заказ отменён.", attachments=[kb_passenger_menu()])
         return
 
     if payload == "driver_online":
@@ -1869,12 +1927,8 @@ async def on_callback(event: MessageCallback):
         save_driver(user_id, driver)
         queue_add(user_id)
         log_event("driver_online", user_id=user_id)
-
         has_coords = driver.get("lat") is not None and driver.get("lon") is not None
-        hint = ""
-        if not has_coords:
-            hint = "\n\n⚠️ Отправьте геопозицию, чтобы получать заказы рядом с вами."
-
+        hint = "\n\n⚠️ Отправьте геопозицию, чтобы получать заказы." if not has_coords else ""
         await event.send(text=f"✅ Вы на линии.{hint}", attachments=[kb_driver_menu()])
         start_location_reminder(user_id)
         return
@@ -1893,9 +1947,8 @@ async def on_callback(event: MessageCallback):
     if payload == "driver_location_request":
         await event.send(
             text=(
-                "📍 Нажмите кнопку ниже, чтобы отправить свою геопозицию.\n\n"
-                "По ней мы будем предлагать заказы рядом с вами.\n\n"
-                "⚠️ Отправляйте геопозицию с телефона — в браузере может не работать."
+                "📍 Нажмите кнопку ниже, чтобы отправить геопозицию.\n\n"
+                "⚠️ Отправляйте с телефона."
             ),
             attachments=[kb_location_only()],
         )
@@ -1906,22 +1959,16 @@ async def on_callback(event: MessageCallback):
         if not driver:
             await event.send(text="Сначала зарегистрируйтесь.", attachments=[kb_driver_menu()])
             return
-
         total = drivers_online_count()
         with_coords = len(drivers_with_fresh_location())
-
-        lines = ["📊 Статистика", ""]
-        lines.append("👤 Ваш статус:")
-
+        lines = ["📊 Статистика", "", "👤 Ваш статус:"]
         if driver.get("status") == "online":
             lines.append("✅ Вы на линии")
         else:
             lines.append("⛔ Вы не на линии")
-
         lat = driver.get("lat")
         lon = driver.get("lon")
         upd = driver.get("location_updated_at")
-
         if lat is not None and lon is not None and upd:
             try:
                 dt = datetime.fromisoformat(upd)
@@ -1932,14 +1979,12 @@ async def on_callback(event: MessageCallback):
                 else:
                     lines.append(f"⏱ Обновлены {age_min} мин назад.")
             except Exception:
-                lines.append("📍 Координаты: (ошибка чтения времени)")
+                lines.append("📍 Координаты: (ошибка)")
         else:
             lines.append("📍 Координаты: не отправлены ⚠️")
-
         lines.append("")
-        lines.append(f"🚗 Всего на линии: {total} водителей")
+        lines.append(f"🚗 Всего на линии: {total}")
         lines.append(f"📡 Со свежими координатами: {with_coords}")
-
         if driver.get("status") == "online":
             lines.append("")
             if lat is not None and lon is not None and upd:
@@ -1954,12 +1999,8 @@ async def on_callback(event: MessageCallback):
                     pass
             else:
                 lines.append("⚠️ Вы в резервном списке.")
-                lines.append("Заказ получите, только если рядом никого не найдётся.")
-                lines.append("")
-                lines.append("Отправьте геопозицию, чтобы получать заказы первыми.")
-
-        text = "\n".join(lines)
-        await event.send(text=text, attachments=[kb_driver_menu()])
+                lines.append("Отправьте геопозицию, чтобы получать заказы.")
+        await event.send(text="\n".join(lines), attachments=[kb_driver_menu()])
         return
 
     if payload.startswith("offer_accept:"):
@@ -1971,22 +2012,18 @@ async def on_callback(event: MessageCallback):
         if order.get("status") != "offered" or order.get("offered_to") != str(user_id):
             await event.send(text="Этот заказ уже не для вас.")
             return
-
         driver = get_driver(user_id)
         update_order(order_id, status="accepted", driver_id=str(user_id))
         queue_remove(user_id)
-
         order_type = order.get("type", "taxi")
         from_text = format_address_full(order["from"])
         to_text = format_address_full(order["to"])
         phone = order.get("phone", "—") or "—"
         distance = order.get("distance_km", "—")
         price = order.get("price", "—")
-
         if order_type == "delivery":
             recipient_name = order.get("recipient_name", "—")
             recipient_phone = order.get("recipient_phone", "—")
-
             await event.send(
                 text=(
                     f"✅ Доставка принята! Езжайте забирать посылку.\n\n"
@@ -2001,7 +2038,6 @@ async def on_callback(event: MessageCallback):
                 ),
                 attachments=[kb_driver_on_way(order_id, "delivery")],
             )
-
             try:
                 await bot.send_message(
                     user_id=order["user_id"],
@@ -2018,7 +2054,6 @@ async def on_callback(event: MessageCallback):
             except Exception as e:
                 logging.warning(f"Не удалось уведомить заказчика: {e}")
             return
-
         await event.send(
             text=(
                 f"✅ Заказ принят! Езжайте к пассажиру.\n\n"
@@ -2030,7 +2065,6 @@ async def on_callback(event: MessageCallback):
             ),
             attachments=[kb_driver_on_way(order_id, "taxi")],
         )
-
         try:
             await bot.send_message(
                 user_id=order["user_id"],
@@ -2058,7 +2092,7 @@ async def on_callback(event: MessageCallback):
             await event.send(text="Этот заказ уже не для вас.")
             return
         queue_move_to_end(user_id)
-        await event.send(text="Вы отказались. Заказ передан следующему водителю.", attachments=[kb_driver_menu()])
+        await event.send(text="Вы отказались. Заказ передан следующему.", attachments=[kb_driver_menu()])
         await try_next_driver(order_id)
         return
 
@@ -2069,11 +2103,9 @@ async def on_callback(event: MessageCallback):
             await event.send(text="Этот заказ не ваш или уже не актуален.")
             return
         if order.get("type") != "delivery":
-            await event.send(text="Это не заказ доставки.")
+            await event.send(text="Это не доставка.")
             return
-
         update_order(order_id, status="picked", picked_at=datetime.now().isoformat())
-
         await event.send(
             text=(
                 f"📦 Посылка забрана. Везём получателю.\n\n"
@@ -2083,18 +2115,14 @@ async def on_callback(event: MessageCallback):
             ),
             attachments=[kb_delivery_picked(order_id)],
         )
-
         try:
             await bot.send_message(
                 user_id=order["user_id"],
-                text=(
-                    f"📦 Курьер забрал посылку и везёт получателю.\n\n"
-                    f"🏁 Доставить: {format_address(order['to'])}"
-                ),
+                text=f"📦 Курьер забрал посылку и везёт получателю.\n\n🏁 Доставить: {format_address(order['to'])}",
                 attachments=[kb_passenger_active_order(order_id)],
             )
-        except Exception as e:
-            logging.warning(f"Не удалось уведомить заказчика: {e}")
+        except Exception:
+            pass
         return
 
     if payload.startswith("trip_arrived:"):
@@ -2104,7 +2132,7 @@ async def on_callback(event: MessageCallback):
             await event.send(text="Этот заказ не ваш или уже не актуален.")
             return
         if order.get("type") != "taxi":
-            await event.send(text="Это не заказ такси.")
+            await event.send(text="Это не такси.")
             return
         update_order(order_id, status="arrived", arrived_at=datetime.now().isoformat())
         await event.send(
@@ -2121,8 +2149,8 @@ async def on_callback(event: MessageCallback):
                 text="📍 Ваш водитель на месте. Выходите!",
                 attachments=[kb_passenger_active_order(order_id)],
             )
-        except Exception as e:
-            logging.warning(f"Не удалось уведомить пассажира: {e}")
+        except Exception:
+            pass
         return
 
     if payload.startswith("trip_start:"):
@@ -2147,8 +2175,8 @@ async def on_callback(event: MessageCallback):
                 text=f"🚗 Поехали! В пути до: {format_address(order['to'])}",
                 attachments=[kb_passenger_active_order(order_id)],
             )
-        except Exception as e:
-            logging.warning(f"Не удалось уведомить пассажира: {e}")
+        except Exception:
+            pass
         return
 
     if payload.startswith("trip_cancel:"):
@@ -2158,18 +2186,13 @@ async def on_callback(event: MessageCallback):
             await event.send(text="Этот заказ не ваш.")
             return
         if order.get("status") not in ("accepted", "arrived"):
-            await event.send(text="Заказ уже нельзя отменить на этом этапе.")
+            await event.send(text="Заказ уже нельзя отменить.")
             return
         update_order(order_id, status="cancelled_by_driver",
                      cancelled_at=datetime.now().isoformat())
         queue_move_to_end(user_id)
-        log_event(
-            "order_cancelled",
-            user_id=user_id,
-            order_id=order_id,
-            order_type=order.get("type", "taxi"),
-            cancelled_by="driver",
-        )
+        log_event("order_cancelled", user_id=user_id, order_id=order_id,
+                  order_type=order.get("type", "taxi"), cancelled_by="driver")
         await event.send(
             text="❌ Заказ отменён. Вы в конце очереди.",
             attachments=[kb_driver_menu()],
@@ -2177,10 +2200,10 @@ async def on_callback(event: MessageCallback):
         try:
             await bot.send_message(
                 user_id=order["user_id"],
-                text="⚠️ К сожалению, водитель отменил заказ.\nМы ищем для вас другого водителя...",
+                text="⚠️ Водитель отменил заказ. Ищем другого...",
             )
-        except Exception as e:
-            logging.warning(f"Не удалось уведомить клиента: {e}")
+        except Exception:
+            pass
         update_order(order_id, status="new", driver_id=None)
         await try_next_driver(order_id)
         return
@@ -2191,9 +2214,7 @@ async def on_callback(event: MessageCallback):
         if not order or order.get("driver_id") != str(user_id):
             await event.send(text="Этот заказ не ваш или уже завершён.")
             return
-
         order_type = order.get("type", "taxi")
-
         if order_type == "delivery":
             if order.get("status") != "picked":
                 await event.send(text="Сначала нажмите «📦 Забрал», потом «🏁 Доставлено».")
@@ -2202,28 +2223,17 @@ async def on_callback(event: MessageCallback):
             driver = get_driver(user_id)
             if driver and driver.get("status") == "online":
                 queue_move_to_end(user_id)
-
-            log_event(
-                "order_finished",
-                user_id=order.get("user_id"),
-                order_id=order_id,
-                order_type="delivery",
-                price=order.get("price", 0),
-            )
-
-            await event.send(
-                text="🏁 Доставка завершена. Спасибо!",
-                attachments=[kb_driver_menu()],
-            )
+            log_event("order_finished", user_id=order.get("user_id"),
+                      order_id=order_id, order_type="delivery", price=order.get("price", 0))
+            await event.send(text="🏁 Доставка завершена. Спасибо!", attachments=[kb_driver_menu()])
             try:
                 await bot.send_message(
                     user_id=order["user_id"],
                     text="🏁 Ваша доставка завершена. Спасибо, что выбрали нас!",
                 )
-            except Exception as e:
-                logging.warning(f"Не удалось уведомить заказчика: {e}")
+            except Exception:
+                pass
             return
-
         if order.get("status") != "in_trip":
             await event.send(text="Этот заказ не ваш или уже завершён.")
             return
@@ -2231,26 +2241,16 @@ async def on_callback(event: MessageCallback):
         driver = get_driver(user_id)
         if driver and driver.get("status") == "online":
             queue_move_to_end(user_id)
-
-        log_event(
-            "order_finished",
-            user_id=order.get("user_id"),
-            order_id=order_id,
-            order_type="taxi",
-            price=order.get("price", 0),
-        )
-
-        await event.send(
-            text="🏁 Поездка завершена. Спасибо!",
-            attachments=[kb_driver_menu()],
-        )
+        log_event("order_finished", user_id=order.get("user_id"),
+                  order_id=order_id, order_type="taxi", price=order.get("price", 0))
+        await event.send(text="🏁 Поездка завершена. Спасибо!", attachments=[kb_driver_menu()])
         try:
             await bot.send_message(
                 user_id=order["user_id"],
                 text="🏁 Ваша поездка завершена. Спасибо, что выбрали нас!",
             )
-        except Exception as e:
-            logging.warning(f"Не удалось уведомить пассажира: {e}")
+        except Exception:
+            pass
         return
 
     await event.send(text=f"Команда {payload} пока не реализована.")
