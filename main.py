@@ -163,22 +163,8 @@ def save_json(path, data):
 
 # ===================== СТАТИСТИКА =====================
 
-def log_event(event_type: str, user_id: int = None, **extra):
-    ts = datetime.now().isoformat()
-    event = {"ts": ts, "event": event_type, "user_id": user_id, **extra}
-    try:
-        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
-    except Exception as e:
-        logging.warning(f"[STATS] Ошибка записи события: {e}")
-    try:
-        _update_stats(event)
-    except Exception as e:
-        logging.warning(f"[STATS] Ошибка обновления агрегата: {e}")
-
-
-def _update_stats(event: dict):
-    stats = load_json(STATS_FILE, {
+def _default_stats():
+    return {
         "total_users": 0,
         "total_passengers": 0,
         "total_drivers": 0,
@@ -195,14 +181,37 @@ def _update_stats(event: dict):
             "taxi_revenue": 0,
             "delivery_revenue": 0,
         },
-    })
+    }
+
+
+def log_event(event_type: str, user_id: int = None, **extra):
+    ts = datetime.now().isoformat()
+    event = {"ts": ts, "event": event_type, "user_id": user_id, **extra}
+    try:
+        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logging.warning(f"[STATS] Ошибка записи события: {e}")
+    try:
+        _update_stats(event)
+    except Exception as e:
+        logging.warning(f"[STATS] Ошибка обновления агрегата: {e}")
+
+
+def _update_stats(event: dict):
+    stats = load_json(STATS_FILE, _default_stats())
 
     etype = event["event"]
     uid = event.get("user_id")
     date = event["ts"][:10]
 
     if date not in stats["by_date"]:
-        stats["by_date"][date] = {"new_users": 0, "orders": 0}
+        stats["by_date"][date] = {
+            "new_users": 0,
+            "orders_created": 0,
+            "orders_finished": 0,
+            "orders_cancelled": 0,
+        }
 
     if etype == "user_started":
         stats["total_users"] += 1
@@ -226,17 +235,19 @@ def _update_stats(event: dict):
     elif etype == "order_created":
         otype = event.get("order_type", "taxi")
         stats["orders"][f"{otype}_created"] += 1
-        stats["by_date"][date]["orders"] += 1
+        stats["by_date"][date]["orders_created"] += 1
 
     elif etype == "order_finished":
         otype = event.get("order_type", "taxi")
         price = event.get("price", 0) or 0
         stats["orders"][f"{otype}_finished"] += 1
         stats["orders"][f"{otype}_revenue"] += price
+        stats["by_date"][date]["orders_finished"] += 1
 
     elif etype == "order_cancelled":
         otype = event.get("order_type", "taxi")
         stats["orders"][f"{otype}_cancelled"] += 1
+        stats["by_date"][date]["orders_cancelled"] += 1
 
     save_json(STATS_FILE, stats)
 
@@ -244,24 +255,7 @@ def _update_stats(event: dict):
 def rebuild_stats_from_users():
     """Пересчитывает счётчики ролей и total_users из users.json (источник правды)."""
     users = load_json(USERS_FILE, {})
-    stats = load_json(STATS_FILE, {
-        "total_users": 0,
-        "total_passengers": 0,
-        "total_drivers": 0,
-        "total_delivery": 0,
-        "users": {},
-        "by_date": {},
-        "orders": {
-            "taxi_created": 0,
-            "taxi_finished": 0,
-            "taxi_cancelled": 0,
-            "delivery_created": 0,
-            "delivery_finished": 0,
-            "delivery_cancelled": 0,
-            "taxi_revenue": 0,
-            "delivery_revenue": 0,
-        },
-    })
+    stats = load_json(STATS_FILE, _default_stats())
 
     passengers = sum(1 for u in users.values() if u.get("role") == "passenger")
     drivers = sum(1 for u in users.values() if u.get("role") == "driver")
@@ -270,13 +264,30 @@ def rebuild_stats_from_users():
     stats["total_passengers"] = passengers
     stats["total_drivers"] = drivers
     stats["total_delivery"] = delivery
-    stats["total_users"] = max(stats.get("total_users", 0), len(users))
+    stats["total_users"] = len(users)
 
     save_json(STATS_FILE, stats)
     logging.info(
         f"[STATS] Пересчёт: пользователей={stats['total_users']}, "
         f"пассажиров={passengers}, водителей={drivers}, доставка={delivery}"
     )
+
+
+def reset_statistics():
+    """Удаляет stats.json и events.jsonl. users.json не трогает."""
+    if os.path.exists(STATS_FILE):
+        try:
+            os.remove(STATS_FILE)
+            logging.info("[STATS] Удалён stats.json")
+        except Exception as e:
+            logging.warning(f"[STATS] Ошибка удаления stats.json: {e}")
+    if os.path.exists(EVENTS_FILE):
+        try:
+            os.remove(EVENTS_FILE)
+            logging.info("[STATS] Удалён events.jsonl")
+        except Exception as e:
+            logging.warning(f"[STATS] Ошибка удаления events.jsonl: {e}")
+    rebuild_stats_from_users()
 
 
 def ensure_user_tracked(user_id: int):
@@ -287,7 +298,7 @@ def ensure_user_tracked(user_id: int):
 
 
 def get_stats_text(period: str = "all") -> str:
-    # Автопересчёт ролей и total_users из users.json — всегда точные цифры
+    # Автопересчёт ролей и total_users из users.json
     rebuild_stats_from_users()
 
     stats = load_json(STATS_FILE, {})
@@ -314,22 +325,22 @@ def get_stats_text(period: str = "all") -> str:
     total_drivers = stats.get("total_drivers", 0)
     total_delivery = stats.get("total_delivery", 0)
 
-    if period_start:
-        new_users = 0
-        orders_in_period = 0
-        for d, v in stats.get("by_date", {}).items():
-            try:
-                dt = datetime.fromisoformat(d + "T00:00:00")
-            except Exception:
-                continue
-            if dt >= period_start:
-                new_users += v.get("new_users", 0)
-                orders_in_period += v.get("orders", 0)
-    else:
-        new_users = total_users
-        orders_in_period = (
-            orders.get("taxi_created", 0) + orders.get("delivery_created", 0)
-        )
+    new_users = 0
+    orders_created = 0
+    orders_finished = 0
+    orders_cancelled = 0
+
+    for d, v in stats.get("by_date", {}).items():
+        try:
+            dt = datetime.fromisoformat(d + "T00:00:00")
+        except Exception:
+            continue
+        if period_start and dt < period_start:
+            continue
+        new_users += v.get("new_users", 0)
+        orders_created += v.get("orders_created", 0)
+        orders_finished += v.get("orders_finished", 0)
+        orders_cancelled += v.get("orders_cancelled", 0)
 
     taxi_rev = orders.get("taxi_revenue", 0)
     delivery_rev = orders.get("delivery_revenue", 0)
@@ -344,7 +355,10 @@ def get_stats_text(period: str = "all") -> str:
         f"• Доставка: {total_delivery}",
         f"• Новых {period_label}: {new_users}",
         "",
-        f"📦 Заказов {period_label}: {orders_in_period}",
+        f"📦 Заказы {period_label}:",
+        f"• Создано: {orders_created}",
+        f"• Завершено: {orders_finished}",
+        f"• Отменено: {orders_cancelled}",
         "",
         "🚕 Такси (всего):",
         f"• Создано: {orders.get('taxi_created', 0)}",
@@ -554,7 +568,6 @@ def queue_add(user_id: int):
     if uid not in q:
         q.append(uid)
         queue_save(q)
-        logging.info(f"Очередь: {uid} добавлен. Текущая очередь: {q}")
     return q
 
 
@@ -564,7 +577,6 @@ def queue_remove(user_id: int):
     if uid in q:
         q.remove(uid)
         queue_save(q)
-        logging.info(f"Очередь: {uid} удалён. Текущая очередь: {q}")
     return q
 
 
@@ -575,7 +587,6 @@ def queue_move_to_end(user_id: int):
         q.remove(uid)
     q.append(uid)
     queue_save(q)
-    logging.info(f"Очередь: {uid} в конец. Текущая очередь: {q}")
     return q
 
 
@@ -1018,6 +1029,7 @@ async def on_message(event: MessageCreated):
     ensure_user_tracked(user_id)
     logging.info(f"📩 {user_id}: '{text}'")
 
+    # ===== /admin =====
     if text == "/admin":
         if user_id != ADMIN_USER_ID:
             return
@@ -1027,6 +1039,20 @@ async def on_message(event: MessageCreated):
         )
         return
 
+    # ===== /admin_reset =====
+    if text == "/admin_reset":
+        if user_id != ADMIN_USER_ID:
+            return
+        reset_statistics()
+        await event.message.answer(
+            "🗑 Статистика сброшена.\n\n"
+            "Счётчики обнулены. Пользователи и заказы сохранены.\n\n"
+            "Напишите /admin — чтобы увидеть новую статистику.",
+            attachments=[kb_stats_period()],
+        )
+        return
+
+    # ===== ГЕОЛОКАЦИЯ =====
     attachments = event.message.body.attachments if event.message.body else None
     if attachments:
         for att in attachments:
