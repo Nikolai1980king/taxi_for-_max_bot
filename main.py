@@ -56,12 +56,15 @@ RADIUS_STEPS = [6, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 LOCATION_TTL_MINUTES = 30
 LOCATION_REMIND_INTERVAL = 30
 
-# Защита от дублей
+AUTO_OFFLINE_MINUTES = 60
+AUTO_OFFLINE_CHECK_INTERVAL = 5 * 60
+
 DEDUP_WINDOW_SECONDS = 2
-_last_messages = {}          # user_id -> (text, timestamp)
+_last_messages = {}
 _processed_callbacks = deque(maxlen=500)
-_last_callback_payloads = {}  # f"{user_id}:{payload}" -> timestamp
+_last_callback_payloads = {}
 _reminder_tasks = {}
+_order_timeouts = {}
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
@@ -76,7 +79,8 @@ HELP_DRIVER = (
     "3️⃣ Отправьте геопозицию — обязательно, иначе не получите заказы.\n"
     "4️⃣ При заказе нажмите «✅ Принять» или «❌ Отказаться».\n"
     "5️⃣ Ведите поездку: «📍 Я на месте» → «🚗 Поехали» → «🏁 Завершить».\n\n"
-    "Вы получаете и заказы такси, и заказы доставки."
+    "⚠️ Обновляйте геопозицию каждые 30 минут. Если не обновлять больше 60 минут — "
+    "вы автоматически снимаетесь с линии."
 )
 
 HELP_DRIVER_GEO = (
@@ -87,7 +91,8 @@ HELP_DRIVER_GEO = (
     "2. Нажмите «📍 Отправить мою геопозицию».\n"
     "3. Разрешите доступ к геолокации.\n\n"
     "⚠️ Отправляйте с телефона — в браузере может не работать.\n\n"
-    "🔄 Обновляйте каждые 30 минут — бот напомнит."
+    "🔄 Обновляйте каждые 30 минут — бот напомнит.\n\n"
+    "⏰ Если не обновлять больше 60 минут — вы автоматически снимаетесь с линии."
 )
 
 HELP_DRIVER_ORDERS = (
@@ -109,7 +114,9 @@ HELP_DRIVER_TRIP = (
     "Доставка:\n"
     "1. Приняли — едете забирать.\n"
     "2. Забрали — «📦 Забрал».\n"
-    "3. Доставили — «🏁 Доставлено»."
+    "3. Доставили — «🏁 Доставлено».\n\n"
+    "⚠️ Если что-то пошло не так — нажмите «❌ Отменить заказ». "
+    "Заказ вернётся в поиск, а вы будете в конце очереди."
 )
 
 HELP_PASSENGER = (
@@ -121,7 +128,9 @@ HELP_PASSENGER = (
     "5️⃣ Подтвердите заказ — увидите цену и расстояние.\n\n"
     "📍 Если заказываете для другого человека — выберите «✏️ Ввести вручную» "
     "и укажите адрес, где находится пассажир. В комментарии напишите, "
-    "для кого заказ и как связаться."
+    "для кого заказ и как связаться.\n\n"
+    "❌ Отменить заказ можно в любой момент — кнопкой «Отменить заказ» "
+    "в сообщении о заказе."
 )
 
 HELP_DELIVERY = (
@@ -560,6 +569,16 @@ def save_driver(user_id: int, data: dict):
     save_json(DRIVERS_FILE, drivers)
 
 
+def has_active_order(driver_id_str: str) -> bool:
+    orders = orders_load()
+    for o in orders:
+        if o.get("driver_id") == driver_id_str and o.get("status") in (
+            "accepted", "arrived", "in_trip", "picked"
+        ):
+            return True
+    return False
+
+
 def drivers_with_fresh_location() -> list:
     drivers = load_json(DRIVERS_FILE, {})
     now = datetime.now()
@@ -578,7 +597,11 @@ def drivers_with_fresh_location() -> list:
             continue
         if now - updated_dt > timedelta(minutes=LOCATION_TTL_MINUTES):
             continue
-        result.append((int(uid_str), lat, lon))
+        try:
+            uid = int(uid_str)
+        except Exception:
+            continue
+        result.append((uid, lat, lon))
     return result
 
 
@@ -660,6 +683,24 @@ def update_order(order_id: str, **fields):
             o.update(fields)
             break
     orders_save(orders)
+
+
+def _add_declined(order_id: str, driver_id_str: str):
+    order = find_order(order_id)
+    if not order:
+        return
+    declined = order.get("declined_by", [])
+    if driver_id_str not in declined:
+        declined.append(driver_id_str)
+        update_order(order_id, declined_by=declined)
+        logging.info(f"[DECLINED] {driver_id_str} отказался от заказа {order_id}. Всего: {declined}")
+
+
+def _cancel_order_timeout(order_id: str):
+    task = _order_timeouts.pop(order_id, None)
+    if task and not task.done():
+        task.cancel()
+        logging.info(f"[TIMEOUT] Отменён таймер для заказа {order_id}")
 
 
 # ===================== ФОРМАТИРОВАНИЕ =====================
@@ -824,8 +865,12 @@ def kb_driver_in_trip(order_id: str):
 
 
 def kb_delivery_picked(order_id: str):
+    # Обновлено: добавлена кнопка отмены
     b = InlineKeyboardBuilder()
-    b.row(CallbackButton(text="🏁 Доставлено", payload=f"trip_finish:{order_id}"))
+    b.row(
+        CallbackButton(text="🏁 Доставлено", payload=f"trip_finish:{order_id}"),
+        CallbackButton(text="❌ Отменить заказ", payload=f"trip_cancel:{order_id}"),
+    )
     b.row(CallbackButton(text="🏠 Назад в меню", payload="main_menu"))
     return b.as_markup()
 
@@ -890,39 +935,73 @@ def stop_location_reminder(user_id: int):
         task.cancel()
 
 
+# ===================== АВТООФЛАЙН =====================
+
+async def auto_offline_loop():
+    while True:
+        await asyncio.sleep(AUTO_OFFLINE_CHECK_INTERVAL)
+        try:
+            drivers = load_json(DRIVERS_FILE, {})
+            now = datetime.now()
+            changed = False
+
+            for uid_str, d in drivers.items():
+                if d.get("status") != "online":
+                    continue
+                if has_active_order(uid_str):
+                    continue
+                upd = d.get("location_updated_at")
+                reason = None
+                if not upd:
+                    reason = "нет геопозиции"
+                else:
+                    try:
+                        upd_dt = datetime.fromisoformat(upd)
+                    except Exception:
+                        continue
+                    if (now - upd_dt).total_seconds() > AUTO_OFFLINE_MINUTES * 60:
+                        reason = f"геопозиция старше {AUTO_OFFLINE_MINUTES} мин"
+                if reason:
+                    d["status"] = "offline"
+                    changed = True
+                    try:
+                        queue_remove(int(uid_str))
+                    except Exception:
+                        pass
+                    try:
+                        stop_location_reminder(int(uid_str))
+                    except Exception:
+                        pass
+                    logging.info(f"[AUTO_OFFLINE] {uid_str} снят с линии: {reason}")
+                    try:
+                        await bot.send_message(
+                            user_id=int(uid_str),
+                            text=(
+                                "⏰ Вы автоматически сняты с линии.\n\n"
+                                f"Причина: {reason}.\n\n"
+                                "Нажмите «Выйти на линию» и отправьте геопозицию, чтобы вернуться."
+                            ),
+                            attachments=[kb_driver_menu()],
+                        )
+                    except Exception as e:
+                        logging.warning(f"[AUTO_OFFLINE] не удалось уведомить {uid_str}: {e}")
+
+            if changed:
+                save_json(DRIVERS_FILE, drivers)
+        except Exception as e:
+            logging.error(f"[AUTO_OFFLINE] ошибка в цикле: {type(e).__name__}: {e}")
+
+
 # ===================== ПОДБОР ВОДИТЕЛЯ =====================
-
-async def find_driver_by_radius(order_id: str):
-    order = find_order(order_id)
-    if not order:
-        return None, None
-    from_addr = order.get("from", {})
-    p_lat = from_addr.get("lat")
-    p_lon = from_addr.get("lon")
-    if p_lat is None or p_lon is None:
-        return None, None
-    drivers_loc = drivers_with_fresh_location()
-    if not drivers_loc:
-        return None, None
-    with_distance = []
-    for uid, d_lat, d_lon in drivers_loc:
-        dist = haversine(p_lat, p_lon, d_lat, d_lon)
-        with_distance.append((uid, dist))
-    with_distance.sort(key=lambda x: x[1])
-    for radius in RADIUS_STEPS:
-        in_radius = [(uid, d) for uid, d in with_distance if d <= radius]
-        if in_radius:
-            uid, dist = in_radius[0]
-            logging.info(f"[RADIUS] Найден {uid} на расстоянии {dist:.2f} км")
-            return uid, dist
-    return None, None
-
 
 async def offer_order_to_driver(order_id: str, driver_id: int, distance_km: float = None):
     order = find_order(order_id)
     driver = get_driver(driver_id)
     if not order or not driver:
         return
+
+    _cancel_order_timeout(order_id)
+
     order_type = order.get("type", "taxi")
     from_text = format_address_full(order["from"])
     to_text = format_address_full(order["to"])
@@ -967,15 +1046,21 @@ async def offer_order_to_driver(order_id: str, driver_id: int, distance_km: floa
     except Exception as e:
         logging.warning(f"Не удалось отправить заказ водителю {driver_id}: {e}")
         queue_move_to_end(driver_id)
+        _add_declined(order_id, str(driver_id))
         await try_next_driver(order_id)
         return
 
     update_order(order_id, status="offered", offered_to=str(driver_id))
 
     async def timeout_task():
-        await asyncio.sleep(ORDER_TIMEOUT)
+        try:
+            await asyncio.sleep(ORDER_TIMEOUT)
+        except asyncio.CancelledError:
+            logging.info(f"[TIMEOUT] Таймер отменён для {order_id}")
+            return
         current = find_order(order_id)
         if current and current.get("status") == "offered" and current.get("offered_to") == str(driver_id):
+            logging.info(f"⏰ Таймер истёк для {driver_id}, заказ {order_id}")
             try:
                 await bot.send_message(
                     user_id=driver_id,
@@ -984,33 +1069,84 @@ async def offer_order_to_driver(order_id: str, driver_id: int, distance_km: floa
             except Exception:
                 pass
             queue_move_to_end(driver_id)
+            _add_declined(order_id, str(driver_id))
             await try_next_driver(order_id)
 
-    asyncio.create_task(timeout_task())
+    task = asyncio.create_task(timeout_task())
+    _order_timeouts[order_id] = task
 
 
 async def try_next_driver(order_id: str):
     order = find_order(order_id)
     if not order or order.get("status") in ("accepted", "arrived", "in_trip", "picked", "finished", "cancelled", "cancelled_by_driver", "cancelled_by_passenger"):
         return
+
+    _cancel_order_timeout(order_id)
+
     if order.get("status") == "offered":
         update_order(order_id, status="new", offered_to=None)
-    driver_id, dist = await find_driver_by_radius(order_id)
+
+    order = find_order(order_id)
+    declined = set(order.get("declined_by", []))
+
+    from_addr = order.get("from", {})
+    p_lat = from_addr.get("lat")
+    p_lon = from_addr.get("lon")
+
+    driver_id = None
+    dist = None
+
+    if p_lat is not None and p_lon is not None:
+        drivers_loc = drivers_with_fresh_location()
+        with_distance = []
+        for uid, d_lat, d_lon in drivers_loc:
+            if str(uid) in declined:
+                continue
+            d = haversine(p_lat, p_lon, d_lat, d_lon)
+            with_distance.append((uid, d))
+        with_distance.sort(key=lambda x: x[1])
+        for radius in RADIUS_STEPS:
+            in_radius = [(uid, d) for uid, d in with_distance if d <= radius]
+            if in_radius:
+                driver_id, dist = in_radius[0]
+                logging.info(f"[RADIUS] Найден {driver_id} на {dist:.2f} км (исключено {len(declined)})")
+                break
+
     if driver_id:
         await offer_order_to_driver(order_id, driver_id, dist)
         return
+
     q = queue_load()
     drivers_loc_ids = {uid for uid, _, _ in drivers_with_fresh_location()}
-    no_coord_queue = [uid for uid in q if int(uid) not in drivers_loc_ids]
-    if no_coord_queue:
-        next_driver = int(no_coord_queue[0])
+    no_coord_candidates = []
+    for uid in q:
+        try:
+            uid_int = int(uid)
+        except Exception:
+            continue
+        if uid_int in drivers_loc_ids:
+            continue
+        if str(uid_int) in declined:
+            continue
+        no_coord_candidates.append(uid_int)
+
+    if no_coord_candidates:
+        next_driver = no_coord_candidates[0]
+        logging.info(f"[RADIUS] Беру водителя без координат: {next_driver}")
         await offer_order_to_driver(order_id, next_driver, None)
         return
+
     update_order(order_id, status="waiting")
+    logging.info(f"[WAITING] Заказ {order_id} — нет водителей (отказались: {len(declined)})")
     try:
         await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            text=f"⚠️ Нет свободных водителей!\n\nЗаказ {order_id} ({order.get('type', 'taxi')})",
+            text=(
+                f"⚠️ Заказ {order_id} — нет водителей!\n\n"
+                f"Тип: {order.get('type', 'taxi')}\n"
+                f"Отказались: {len(declined)} водителей\n\n"
+                f"Пассажир ждёт."
+            ),
         )
     except Exception:
         pass
@@ -1069,7 +1205,6 @@ def get_current_delivery_step(state: dict):
 
 async def send_next_step(chat_answer, data: dict):
     next_step = get_current_step({"data": data})
-    logging.info(f"[send_next_step] data={data}, next_step={next_step}")
     if next_step is None:
         return False
     _, next_field, next_question = next_step
@@ -1094,7 +1229,6 @@ async def handle_order_step(event: MessageCreated, user_id: int, text: str, stat
     data = state.get("data", {})
 
     current = get_current_step(state)
-    logging.info(f"[handle_order_step] text='{text}', current={current}, data_from={data.get('from')}")
     if current is None:
         await show_order_summary(event, user_id, data)
         return
@@ -1109,15 +1243,12 @@ async def handle_order_step(event: MessageCreated, user_id: int, text: str, stat
     if addr_key not in data:
         data[addr_key] = {}
 
-    # Защита: если значение уже сохранено — не отправляем шаг повторно
     if data[addr_key].get(field) == text:
         logging.info(f"[order_step] {addr_key}.{field} уже = '{text}' — пропуск")
         return
 
     data[addr_key][field] = text
-    set_data_log = {"step": "order", "data": data}
-    set_state(user_id, set_data_log)
-    logging.info(f"[handle_order_step] после сохранения: data_from={data.get('from')}")
+    set_state(user_id, {"step": "order", "data": data})
 
     if get_current_step({"data": data}) is None:
         await show_order_summary(event, user_id, data)
@@ -1145,7 +1276,6 @@ async def handle_delivery_step(event: MessageCreated, user_id: int, text: str, s
     if addr_key not in data:
         data[addr_key] = {}
 
-    # Защита от дублей
     if data[addr_key].get(field) == text:
         logging.info(f"[delivery_step] {addr_key}.{field} уже = '{text}' — пропуск")
         return
@@ -1316,6 +1446,17 @@ async def handle_passenger_geo(event, user_id: int, lat: float, lon: float):
     )
 
 
+def _need_geo_warning(driver: dict) -> bool:
+    upd = driver.get("location_updated_at")
+    if not upd:
+        return True
+    try:
+        upd_dt = datetime.fromisoformat(upd)
+    except Exception:
+        return True
+    return (datetime.now() - upd_dt).total_seconds() > AUTO_OFFLINE_MINUTES * 60
+
+
 # ===================== ОБРАБОТЧИКИ =====================
 
 @dp.bot_started()
@@ -1361,14 +1502,12 @@ async def on_message(event: MessageCreated):
     user_id = event.message.sender.user_id
     text = (event.message.body.text or "").strip()
 
-    # ===== ЗАЩИТА ОТ ДУБЛЕЙ =====
     now = time.time()
     last = _last_messages.get(user_id)
     if last and last[0] == text and (now - last[1]) < DEDUP_WINDOW_SECONDS:
-        logging.info(f"[on_message] Дубль '{text}' за {DEDUP_WINDOW_SECONDS}с — пропуск")
+        logging.info(f"[on_message] Дубль '{text}' — пропуск")
         return
     _last_messages[user_id] = (text, now)
-    # ============================
 
     ensure_user_tracked(user_id)
     logging.info(f"📩 {user_id}: '{text}'")
@@ -1391,7 +1530,6 @@ async def on_message(event: MessageCreated):
         )
         return
 
-    # ===== ГЕОЛОКАЦИЯ =====
     attachments = event.message.body.attachments if event.message.body else None
     if attachments:
         for att in attachments:
@@ -1404,7 +1542,6 @@ async def on_message(event: MessageCreated):
                     state = get_state(user_id)
                     step = state.get("step")
 
-                    # Водитель обновляет координаты
                     driver = get_driver(user_id)
                     if driver:
                         driver["lat"] = lat
@@ -1418,7 +1555,6 @@ async def on_message(event: MessageCreated):
                         )
                         return
 
-                    # Пассажир в процессе заказа — reverse geocoding
                     if step == "order_geo_wait":
                         await handle_passenger_geo(event, user_id, lat, lon)
                         return
@@ -1519,18 +1655,16 @@ async def on_callback(event: MessageCallback):
     payload = event.callback.payload or ""
     callback_id = event.callback.callback_id
 
-    # Уровень 1: одинаковый callback_id
     if callback_id in _processed_callbacks:
         logging.info(f"⏭ Дубль callback_id {callback_id} — пропуск")
         return
     _processed_callbacks.append(callback_id)
 
-    # Уровень 2: одинаковый user_id + payload за 2 сек
     now = time.time()
     key = f"{user_id}:{payload}"
     last = _last_callback_payloads.get(key)
     if last and (now - last) < DEDUP_WINDOW_SECONDS:
-        logging.info(f"⏭ Дубль callback {payload} за {DEDUP_WINDOW_SECONDS}с — пропуск")
+        logging.info(f"⏭ Дубль callback {payload} — пропуск")
         return
     _last_callback_payloads[key] = now
 
@@ -1586,7 +1720,6 @@ async def on_callback(event: MessageCallback):
         await event.send(text=HELP_DELIVERY, attachments=[b.as_markup()])
         return
 
-    # ===== ГЕОЛОКАЦИЯ ПАССАЖИРА =====
     if payload == "from_geo":
         state = get_state(user_id)
         if state.get("step") == "order_geo_wait":
@@ -1620,13 +1753,14 @@ async def on_callback(event: MessageCallback):
         if "from" not in data:
             await event.send(text="Ошибка: адрес потерян.")
             return
-        data["from"]["phone"] = ""  # ← добавить
+        data["from"]["phone"] = ""
         set_state(user_id, {"step": "order", "data": data})
         await event.send(
-            text=ORDER_STEPS[4][2],  # комментарий
+            text=ORDER_STEPS[4][2],
             attachments=[kb_skip_optional()],
         )
         return
+
     if payload == "skip_optional":
         state = get_state(user_id)
         step = state.get("step")
@@ -1801,6 +1935,7 @@ async def on_callback(event: MessageCallback):
                 "recipient_phone": recipient.get("phone", "—"),
                 "distance_km": distance, "price": price,
                 "status": "new", "driver_id": None,
+                "declined_by": [],
                 "created_at": datetime.now().isoformat(),
             }
             save_order(order)
@@ -1844,6 +1979,7 @@ async def on_callback(event: MessageCallback):
             "phone": phone_text,
             "distance_km": distance, "price": price,
             "status": "new", "driver_id": None,
+            "declined_by": [],
             "created_at": datetime.now().isoformat(),
         }
         save_order(order)
@@ -1885,6 +2021,7 @@ async def on_callback(event: MessageCallback):
             await event.send(text="Заказ отменён.", attachments=[kb_passenger_menu()])
         return
 
+    # ===== ОТМЕНА ЗАКАЗА ПАССАЖИРОМ =====
     if payload.startswith("passenger_cancel:"):
         order_id = payload.split(":", 1)[1]
         order = find_order(order_id)
@@ -1894,10 +2031,17 @@ async def on_callback(event: MessageCallback):
         if order.get("status") in ("finished", "cancelled", "cancelled_by_driver", "cancelled_by_passenger"):
             await event.send(text="Заказ уже завершён или отменён.")
             return
+
+        status = order.get("status")
+        if status in ("accepted", "arrived"):
+            logging.info(f"[passenger_cancel] Отмена на этапе {status} для заказа {order_id}")
+
         update_order(order_id, status="cancelled_by_passenger",
                      cancelled_at=datetime.now().isoformat())
+        _cancel_order_timeout(order_id)
         log_event("order_cancelled", user_id=user_id, order_id=order_id,
                   order_type=order.get("type", "taxi"), cancelled_by="passenger")
+
         driver_id = order.get("driver_id")
         if driver_id:
             drv = get_driver(int(driver_id))
@@ -1911,6 +2055,7 @@ async def on_callback(event: MessageCallback):
                 )
             except Exception:
                 pass
+
         role = get_role(user_id)
         if role == "delivery":
             await event.send(text="❌ Заказ доставки отменён.", attachments=[kb_delivery_menu()])
@@ -1974,10 +2119,11 @@ async def on_callback(event: MessageCallback):
                 dt = datetime.fromisoformat(upd)
                 age_min = int((datetime.now() - dt).total_seconds() / 60)
                 lines.append(f"📍 Координаты: {lat:.5f}, {lon:.5f}")
-                if age_min > LOCATION_TTL_MINUTES:
+                if age_min > AUTO_OFFLINE_MINUTES:
                     lines.append(f"⚠️ Обновлены {age_min} мин назад — устарели!")
                 else:
                     lines.append(f"⏱ Обновлены {age_min} мин назад.")
+                    lines.append(f"⏰ До автоофлайна: {AUTO_OFFLINE_MINUTES - age_min} мин")
             except Exception:
                 lines.append("📍 Координаты: (ошибка)")
         else:
@@ -1991,7 +2137,7 @@ async def on_callback(event: MessageCallback):
                 try:
                     dt = datetime.fromisoformat(upd)
                     age_min = int((datetime.now() - dt).total_seconds() / 60)
-                    if age_min > LOCATION_TTL_MINUTES:
+                    if age_min > AUTO_OFFLINE_MINUTES:
                         lines.append("Обновите геопозицию, чтобы получать заказы.")
                     else:
                         lines.append("Вы участвуете в подборе заказов по расстоянию.")
@@ -2012,8 +2158,11 @@ async def on_callback(event: MessageCallback):
         if order.get("status") != "offered" or order.get("offered_to") != str(user_id):
             await event.send(text="Этот заказ уже не для вас.")
             return
+
+        _cancel_order_timeout(order_id)
+
         driver = get_driver(user_id)
-        update_order(order_id, status="accepted", driver_id=str(user_id))
+        update_order(order_id, status="accepted", driver_id=str(user_id), declined_by=[])
         queue_remove(user_id)
         order_type = order.get("type", "taxi")
         from_text = format_address_full(order["from"])
@@ -2091,6 +2240,10 @@ async def on_callback(event: MessageCallback):
         if order.get("offered_to") != str(user_id):
             await event.send(text="Этот заказ уже не для вас.")
             return
+
+        _cancel_order_timeout(order_id)
+        _add_declined(order_id, str(user_id))
+
         queue_move_to_end(user_id)
         await event.send(text="Вы отказались. Заказ передан следующему.", attachments=[kb_driver_menu()])
         await try_next_driver(order_id)
@@ -2179,31 +2332,51 @@ async def on_callback(event: MessageCallback):
             pass
         return
 
+    # ===== ОТМЕНА ЗАКАЗА ВОДИТЕЛЕМ (включая picked) =====
     if payload.startswith("trip_cancel:"):
         order_id = payload.split(":", 1)[1]
         order = find_order(order_id)
         if not order or order.get("driver_id") != str(user_id):
             await event.send(text="Этот заказ не ваш.")
             return
-        if order.get("status") not in ("accepted", "arrived"):
+
+        status = order.get("status")
+        if status not in ("accepted", "arrived", "picked"):
             await event.send(text="Заказ уже нельзя отменить.")
             return
+
+        logging.info(f"[trip_cancel] Отмена на этапе {status} для заказа {order_id}")
+
         update_order(order_id, status="cancelled_by_driver",
                      cancelled_at=datetime.now().isoformat())
+        _cancel_order_timeout(order_id)
         queue_move_to_end(user_id)
         log_event("order_cancelled", user_id=user_id, order_id=order_id,
                   order_type=order.get("type", "taxi"), cancelled_by="driver")
+
         await event.send(
             text="❌ Заказ отменён. Вы в конце очереди.",
             attachments=[kb_driver_menu()],
         )
+
+        # Уведомление заказчику
         try:
-            await bot.send_message(
-                user_id=order["user_id"],
-                text="⚠️ Водитель отменил заказ. Ищем другого...",
-            )
+            if status == "picked":
+                await bot.send_message(
+                    user_id=order["user_id"],
+                    text=(
+                        "⚠️ К сожалению, курьер отменил заказ после того, как забрал посылку.\n\n"
+                        "Мы ищем другого курьера. Пожалуйста, ожидайте."
+                    ),
+                )
+            else:
+                await bot.send_message(
+                    user_id=order["user_id"],
+                    text="⚠️ Водитель отменил заказ. Ищем другого...",
+                )
         except Exception:
             pass
+
         update_order(order_id, status="new", driver_id=None)
         await try_next_driver(order_id)
         return
@@ -2226,6 +2399,19 @@ async def on_callback(event: MessageCallback):
             log_event("order_finished", user_id=order.get("user_id"),
                       order_id=order_id, order_type="delivery", price=order.get("price", 0))
             await event.send(text="🏁 Доставка завершена. Спасибо!", attachments=[kb_driver_menu()])
+            drv = get_driver(user_id)
+            if drv and _need_geo_warning(drv):
+                try:
+                    await bot.send_message(
+                        user_id=user_id,
+                        text=(
+                            "⚠️ Ваша геопозиция устарела (больше 60 минут).\n\n"
+                            "Отправьте её, чтобы остаться на линии и получать заказы."
+                        ),
+                        attachments=[kb_location_only()],
+                    )
+                except Exception:
+                    pass
             try:
                 await bot.send_message(
                     user_id=order["user_id"],
@@ -2244,6 +2430,19 @@ async def on_callback(event: MessageCallback):
         log_event("order_finished", user_id=order.get("user_id"),
                   order_id=order_id, order_type="taxi", price=order.get("price", 0))
         await event.send(text="🏁 Поездка завершена. Спасибо!", attachments=[kb_driver_menu()])
+        drv = get_driver(user_id)
+        if drv and _need_geo_warning(drv):
+            try:
+                await bot.send_message(
+                    user_id=user_id,
+                    text=(
+                        "⚠️ Ваша геопозиция устарела (больше 60 минут).\n\n"
+                        "Отправьте её, чтобы остаться на линии и получать заказы."
+                    ),
+                    attachments=[kb_location_only()],
+                )
+            except Exception:
+                pass
         try:
             await bot.send_message(
                 user_id=order["user_id"],
@@ -2261,6 +2460,7 @@ async def main():
         await bot.delete_webhook()
     except Exception:
         pass
+    asyncio.create_task(auto_offline_loop())
     logging.info("Бот запущен, слушаю события...")
     await dp.start_polling(bot)
 
