@@ -122,11 +122,11 @@ HELP_DRIVER_TRIP = (
 HELP_PASSENGER = (
     "🧑 Инструкция для пассажира\n\n"
     "1️⃣ Нажмите «Заказать такси».\n"
-    "2️⃣ Выберите «📍 Я сейчас здесь» или «✏️ Ввести вручную».\n"
-    "3️⃣ Введите адрес «Куда» — куда ехать.\n"
+    "2️⃣ Укажите **адрес подачи** — «📍 Отправить мою геопозицию» или «✏️ Ввести адрес вручную».\n"
+    "3️⃣ Укажите **адрес назначения** — так же.\n"
     "4️⃣ Укажите телефон для связи (или пропустите).\n"
     "5️⃣ Подтвердите заказ — увидите цену и расстояние.\n\n"
-    "📍 Если заказываете для другого человека — выберите «✏️ Ввести вручную» "
+    "📍 Если заказываете для другого человека — выберите «✏️ Ввести адрес вручную» "
     "и укажите адрес, где находится пассажир. В комментарии напишите, "
     "для кого заказ и как связаться.\n\n"
     "❌ Отменить заказ можно в любой момент — кнопкой «Отменить заказ» "
@@ -865,7 +865,6 @@ def kb_driver_in_trip(order_id: str):
 
 
 def kb_delivery_picked(order_id: str):
-    # Обновлено: добавлена кнопка отмены
     b = InlineKeyboardBuilder()
     b.row(
         CallbackButton(text="🏁 Доставлено", payload=f"trip_finish:{order_id}"),
@@ -880,8 +879,8 @@ def kb_delivery_picked(order_id: str):
 def kb_from_choice():
     b = InlineKeyboardBuilder()
     b.row(
-        CallbackButton(text="📍 Я сейчас здесь", payload="from_geo"),
-        CallbackButton(text="✏️ Ввести вручную", payload="from_manual"),
+        CallbackButton(text="📍 Отправить мою геопозицию", payload="from_geo"),
+        CallbackButton(text="✏️ Ввести адрес вручную", payload="from_manual"),
     )
     b.row(CallbackButton(text="🏠 Назад в меню", payload="main_menu"))
     return b.as_markup()
@@ -889,8 +888,8 @@ def kb_from_choice():
 
 def kb_from_geo_location():
     b = InlineKeyboardBuilder()
-    b.row(RequestGeoLocationButton(text="📍 Отправить геопозицию"))
-    b.row(CallbackButton(text="✏️ Ввести вручную", payload="from_manual"))
+    b.row(RequestGeoLocationButton(text="📍 Отправить мою геопозицию"))
+    b.row(CallbackButton(text="✏️ Ввести адрес вручную", payload="from_manual"))
     return b.as_markup()
 
 
@@ -898,7 +897,35 @@ def kb_from_confirm():
     b = InlineKeyboardBuilder()
     b.row(
         CallbackButton(text="✅ Верно", payload="from_confirmed"),
-        CallbackButton(text="✏️ Ввести вручную", payload="from_manual"),
+        CallbackButton(text="✏️ Ввести адрес вручную", payload="from_manual"),
+    )
+    return b.as_markup()
+
+
+# ===== КЛАВИАТУРЫ ДЛЯ «КУДА» =====
+
+def kb_to_choice():
+    b = InlineKeyboardBuilder()
+    b.row(
+        CallbackButton(text="📍 Отправить мою геопозицию", payload="to_geo"),
+        CallbackButton(text="✏️ Ввести адрес вручную", payload="to_manual"),
+    )
+    b.row(CallbackButton(text="🏠 Назад в меню", payload="main_menu"))
+    return b.as_markup()
+
+
+def kb_to_geo_location():
+    b = InlineKeyboardBuilder()
+    b.row(RequestGeoLocationButton(text="📍 Отправить мою геопозицию"))
+    b.row(CallbackButton(text="✏️ Ввести адрес вручную", payload="to_manual"))
+    return b.as_markup()
+
+
+def kb_to_confirm():
+    b = InlineKeyboardBuilder()
+    b.row(
+        CallbackButton(text="✅ Верно", payload="to_confirmed"),
+        CallbackButton(text="✏️ Ввести адрес вручную", payload="to_manual"),
     )
     return b.as_markup()
 
@@ -1185,8 +1212,11 @@ DELIVERY_STEPS = [
 def get_current_step(state: dict):
     data = state.get("data", {})
     from_geo = bool(data.get("from", {}).get("lat"))
+    to_geo = bool(data.get("to", {}).get("lat"))
     for addr_key, field, question in ORDER_STEPS:
         if addr_key == "from" and from_geo and field in ("city", "street", "house"):
+            continue
+        if addr_key == "to" and to_geo and field in ("city", "street", "house"):
             continue
         addr = data.get(addr_key, {})
         if field not in addr:
@@ -1321,8 +1351,8 @@ async def show_order_summary(event, user_id: int, data: dict):
 
     await send_func(
         f"📋 Проверьте ваш заказ:\n\n"
-        f"📍 ОТКУДА:\n{from_text}\n\n"
-        f"🏁 КУДА:\n{to_text}\n\n"
+        f"📍 Адрес подачи:\n{from_text}\n\n"
+        f"🏁 Адрес назначения:\n{to_text}\n\n"
         f"📏 Расстояние: {distance} км\n"
         f"💰 Цена: {price} ₽\n"
         f"📞 Телефон: {phone}\n\n"
@@ -1415,13 +1445,14 @@ async def handle_driver_reg(event: MessageCreated, user_id: int, text: str, stat
         return
 
 
-async def handle_passenger_geo(event, user_id: int, lat: float, lon: float):
-    await event.message.answer("🔎 Определяю адрес, подождите...")
+async def handle_passenger_geo_from(event, user_id: int, lat: float, lon: float):
+    """Координаты для точки «Адрес подачи»."""
+    await event.message.answer("🔎 Определяю адрес подачи, подождите...")
     addr = await reverse_geocode(lat, lon)
 
     if not addr:
         await event.message.answer(
-            "⚠️ Не удалось определить адрес.\n\n"
+            "⚠️ Не удалось определить адрес подачи.\n\n"
             "Введите вручную:\n\n" + ORDER_STEPS[0][2],
         )
         set_state(user_id, {"step": "order", "data": {"from": {}}})
@@ -1434,15 +1465,52 @@ async def handle_passenger_geo(event, user_id: int, lat: float, lon: float):
         "lat": lat,
         "lon": lon,
     }
-    set_state(user_id, {"step": "order_geo_confirm", "data": {"from": from_data}})
+    set_state(user_id, {"step": "order_geo_confirm_from", "data": {"from": from_data}})
 
     house_note = "" if addr["house"] else "\n⚠️ Дом не определён — уточните в комментарии."
     await event.message.answer(
-        f"📍 Ваш адрес:\n"
+        f"📍 Адрес подачи:\n"
         f"{format_address(from_data)}"
         f"{house_note}\n\n"
         f"Всё верно?",
         attachments=[kb_from_confirm()],
+    )
+
+
+async def handle_passenger_geo_to(event, user_id: int, lat: float, lon: float):
+    """Координаты для точки «Адрес назначения»."""
+    await event.message.answer("🔎 Определяю адрес назначения, подождите...")
+    addr = await reverse_geocode(lat, lon)
+
+    if not addr:
+        await event.message.answer(
+            "⚠️ Не удалось определить адрес назначения.\n\n"
+            "Введите вручную:\n\n" + ORDER_STEPS[5][2],
+        )
+        state = get_state(user_id)
+        data = state.get("data", {})
+        data.setdefault("to", {})
+        set_state(user_id, {"step": "order", "data": data})
+        return
+
+    state = get_state(user_id)
+    data = state.get("data", {})
+    data["to"] = {
+        "city": addr["city"],
+        "street": addr["street"],
+        "house": addr["house"],
+        "lat": lat,
+        "lon": lon,
+    }
+    set_state(user_id, {"step": "order_geo_confirm_to", "data": data})
+
+    house_note = "" if addr["house"] else "\n⚠️ Дом не определён — уточните в комментарии."
+    await event.message.answer(
+        f"🏁 Адрес назначения:\n"
+        f"{format_address(data['to'])}"
+        f"{house_note}\n\n"
+        f"Всё верно?",
+        attachments=[kb_to_confirm()],
     )
 
 
@@ -1555,8 +1623,12 @@ async def on_message(event: MessageCreated):
                         )
                         return
 
-                    if step == "order_geo_wait":
-                        await handle_passenger_geo(event, user_id, lat, lon)
+                    if step == "order_geo_wait_from":
+                        await handle_passenger_geo_from(event, user_id, lat, lon)
+                        return
+
+                    if step == "order_geo_wait_to":
+                        await handle_passenger_geo_to(event, user_id, lat, lon)
                         return
 
                     await event.message.answer("⚠️ Координаты получены, но сейчас они не нужны.")
@@ -1720,15 +1792,18 @@ async def on_callback(event: MessageCallback):
         await event.send(text=HELP_DELIVERY, attachments=[b.as_markup()])
         return
 
+    # ===== ГЕОЛОКАЦИЯ ПАССАЖИРА — АДРЕС ПОДАЧИ =====
     if payload == "from_geo":
         state = get_state(user_id)
-        if state.get("step") == "order_geo_wait":
-            logging.info("[from_geo] уже в ожидании геолокации — пропуск")
+        if state.get("step") == "order_geo_wait_from":
+            logging.info("[from_geo] уже в ожидании — пропуск")
             return
-        set_state(user_id, {"step": "order_geo_wait", "data": {}})
+        data = state.get("data", {})
+        set_state(user_id, {"step": "order_geo_wait_from", "data": data})
         await event.send(
             text=(
-                "📍 Нажмите кнопку ниже, чтобы отправить свою геопозицию.\n\n"
+                "📍 **Адрес подачи**\n\n"
+                "Нажмите кнопку ниже, чтобы отправить геопозицию **точки подачи**.\n\n"
                 "⚠️ Отправляйте с телефона — в браузере может не работать."
             ),
             attachments=[kb_from_geo_location()],
@@ -1747,7 +1822,7 @@ async def on_callback(event: MessageCallback):
     if payload == "from_confirmed":
         state = get_state(user_id)
         step = state.get("step")
-        if step != "order_geo_confirm":
+        if step != "order_geo_confirm_from":
             return
         data = state.get("data", {})
         if "from" not in data:
@@ -1757,6 +1832,51 @@ async def on_callback(event: MessageCallback):
         set_state(user_id, {"step": "order", "data": data})
         await event.send(
             text=ORDER_STEPS[4][2],
+            attachments=[kb_skip_optional()],
+        )
+        return
+
+    # ===== ГЕОЛОКАЦИЯ ПАССАЖИРА — АДРЕС НАЗНАЧЕНИЯ =====
+    if payload == "to_geo":
+        state = get_state(user_id)
+        if state.get("step") == "order_geo_wait_to":
+            logging.info("[to_geo] уже в ожидании — пропуск")
+            return
+        data = state.get("data", {})
+        set_state(user_id, {"step": "order_geo_wait_to", "data": data})
+        await event.send(
+            text=(
+                "🏁 **Адрес назначения**\n\n"
+                "Нажмите кнопку ниже, чтобы отправить геопозицию **точки назначения**.\n\n"
+                "⚠️ Отправляйте с телефона."
+            ),
+            attachments=[kb_to_geo_location()],
+        )
+        return
+
+    if payload == "to_manual":
+        state = get_state(user_id)
+        if state.get("step") == "order" and state.get("data", {}).get("to", {}).get("city"):
+            logging.info("[to_manual] уже в ручном вводе — пропуск")
+            return
+        data = state.get("data", {})
+        data.setdefault("to", {})
+        set_state(user_id, {"step": "order", "data": data})
+        await event.send(text=ORDER_STEPS[5][2])
+        return
+
+    if payload == "to_confirmed":
+        state = get_state(user_id)
+        step = state.get("step")
+        if step != "order_geo_confirm_to":
+            return
+        data = state.get("data", {})
+        if "to" not in data:
+            await event.send(text="Ошибка: адрес потерян.")
+            return
+        set_state(user_id, {"step": "order", "data": data})
+        await event.send(
+            text=ORDER_STEPS[8][2],
             attachments=[kb_skip_optional()],
         )
         return
@@ -1798,7 +1918,22 @@ async def on_callback(event: MessageCallback):
             data[addr_key] = {}
         data[addr_key][field] = ""
         set_state(user_id, {"step": "order", "data": data})
-        if get_current_step({"data": data}) is None:
+
+        next_step = get_current_step({"data": data})
+        if next_step and next_step[0] == "to" and next_step[1] == "city":
+            set_state(user_id, {"step": "order_choose_to", "data": data})
+            await event.send(
+                text=(
+                    f"✅ Адрес подачи выбран.\n\n"
+                    f"🏁 **Адрес назначения** — куда ехать?\n\n"
+                    f"• «📍 Отправить мою геопозицию» — я на месте назначения.\n"
+                    f"• «✏️ Ввести адрес вручную» — если адрес другой."
+                ),
+                attachments=[kb_to_choice()],
+            )
+            return
+
+        if next_step is None:
             await show_order_summary(event, user_id, data)
             return
         await send_next_step(event.send, data)
@@ -1847,9 +1982,9 @@ async def on_callback(event: MessageCallback):
         await event.send(
             text=(
                 f"{info}\n\n"
-                f"📍 Откуда подать машину?\n\n"
-                f"• «📍 Я сейчас здесь» — отправить геопозицию.\n"
-                f"• «✏️ Ввести вручную» — если заказываете для другого или хотите указать адрес."
+                f"📍 **Адрес подачи** — откуда забрать пассажира?\n\n"
+                f"• «📍 Отправить мою геопозицию» — я на месте подачи.\n"
+                f"• «✏️ Ввести адрес вручную» — если заказываете для другого."
             ),
             attachments=[kb_from_choice()],
         )
@@ -1988,8 +2123,8 @@ async def on_callback(event: MessageCallback):
         await event.send(
             text=(
                 f"✅ Заказ принят!\n\n"
-                f"📍 Откуда: {format_address(from_addr)}\n"
-                f"🏁 Куда: {format_address(to_addr)}\n"
+                f"📍 Адрес подачи: {format_address(from_addr)}\n"
+                f"🏁 Адрес назначения: {format_address(to_addr)}\n"
                 f"📏 Расстояние: {distance} км\n"
                 f"💰 Цена: {price} ₽\n"
                 f"📞 Телефон: {phone_text}\n\n"
@@ -2001,8 +2136,8 @@ async def on_callback(event: MessageCallback):
                 chat_id=ADMIN_CHAT_ID,
                 text=(
                     f"🚕 Новый заказ такси {order_id}\n\n"
-                    f"Откуда: {format_address_full(from_addr)}\n"
-                    f"Куда: {format_address_full(to_addr)}\n"
+                    f"Адрес подачи: {format_address_full(from_addr)}\n"
+                    f"Адрес назначения: {format_address_full(to_addr)}\n"
                     f"Расстояние: {distance} км\nЦена: {price} ₽\n"
                     f"Телефон: {phone_text}\nПассажир: {user_id}"
                 ),
@@ -2021,7 +2156,6 @@ async def on_callback(event: MessageCallback):
             await event.send(text="Заказ отменён.", attachments=[kb_passenger_menu()])
         return
 
-    # ===== ОТМЕНА ЗАКАЗА ПАССАЖИРОМ =====
     if payload.startswith("passenger_cancel:"):
         order_id = payload.split(":", 1)[1]
         order = find_order(order_id)
@@ -2206,8 +2340,8 @@ async def on_callback(event: MessageCallback):
         await event.send(
             text=(
                 f"✅ Заказ принят! Езжайте к пассажиру.\n\n"
-                f"📍 Откуда:\n{from_text}\n\n"
-                f"🏁 Куда:\n{to_text}\n\n"
+                f"📍 Адрес подачи:\n{from_text}\n\n"
+                f"🏁 Адрес назначения:\n{to_text}\n\n"
                 f"📏 Длина поездки: {distance} км\n"
                 f"💰 Цена: {price} ₽\n"
                 f"📞 Телефон пассажира: {phone}"
@@ -2332,7 +2466,6 @@ async def on_callback(event: MessageCallback):
             pass
         return
 
-    # ===== ОТМЕНА ЗАКАЗА ВОДИТЕЛЕМ (включая picked) =====
     if payload.startswith("trip_cancel:"):
         order_id = payload.split(":", 1)[1]
         order = find_order(order_id)
@@ -2359,7 +2492,6 @@ async def on_callback(event: MessageCallback):
             attachments=[kb_driver_menu()],
         )
 
-        # Уведомление заказчику
         try:
             if status == "picked":
                 await bot.send_message(
