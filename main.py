@@ -879,7 +879,7 @@ def kb_delivery_picked(order_id: str):
 def kb_from_choice():
     b = InlineKeyboardBuilder()
     b.row(
-        CallbackButton(text="📍 Отправить мою геопозицию", payload="from_geo"),
+        CallbackButton(text="📍 Выбрать адрес подачи", payload="from_geo"),
         CallbackButton(text="✏️ Ввести адрес вручную", payload="from_manual"),
     )
     b.row(CallbackButton(text="🏠 Назад в меню", payload="main_menu"))
@@ -907,7 +907,7 @@ def kb_from_confirm():
 def kb_to_choice():
     b = InlineKeyboardBuilder()
     b.row(
-        CallbackButton(text="📍 Отправить мою геопозицию", payload="to_geo"),
+        CallbackButton(text="📍 Точка куда едем", payload="to_geo"),
         CallbackButton(text="✏️ Ввести адрес вручную", payload="to_manual"),
     )
     b.row(CallbackButton(text="🏠 Назад в меню", payload="main_menu"))
@@ -916,7 +916,7 @@ def kb_to_choice():
 
 def kb_to_geo_location():
     b = InlineKeyboardBuilder()
-    b.row(RequestGeoLocationButton(text="📍 Отправить мою геопозицию"))
+    b.row(RequestGeoLocationButton(text="📍 Точка куда едем"))
     b.row(CallbackButton(text="✏️ Ввести адрес вручную", payload="to_manual"))
     return b.as_markup()
 
@@ -1982,9 +1982,9 @@ async def on_callback(event: MessageCallback):
         await event.send(
             text=(
                 f"{info}\n\n"
-                f"📍 **Адрес подачи** — откуда забрать пассажира?\n\n"
-                f"• «📍 Отправить мою геопозицию» — я на месте подачи.\n"
-                f"• «✏️ Ввести адрес вручную» — если заказываете для другого."
+                #f"📍 **Выберите адрес подачи** — откуда забрать пассажира?\n\n"
+                f"• «📍 Выберите адрес подачи» — я на месте подачи.\n"
+                f"• «✏️ Ввести адрес вручную» — если не определяется геопозиция."
             ),
             attachments=[kb_from_choice()],
         )
